@@ -8,7 +8,8 @@
 namespace Events {
 
 	class Observer :
-		public RE::BSTEventSink<RE::MenuOpenCloseEvent> {
+		public RE::BSTEventSink<RE::MenuOpenCloseEvent>,
+		public RE::BSTEventSink<RE::TESLoadGameEvent> {
 
 	public:
 		static Observer* Get();
@@ -26,8 +27,10 @@ namespace Events {
 		Observer& operator=(Observer&&) = delete;
 
 		RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent& a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override;
+		RE::BSEventNotifyControl ProcessEvent(const RE::TESLoadGameEvent& a_event, RE::BSTEventSource<RE::TESLoadGameEvent>*) override;
 
 		void ResetArms();
+		void ResetCameraState();
 	};
 
 }

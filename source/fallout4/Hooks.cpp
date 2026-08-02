@@ -67,10 +67,22 @@ namespace Patch {
 		inline bool g_SceneGraphHooksInstalled = false;
 		inline bool g_NiNodeHooksInstalled = false;
 
-		static bool IsActive()
+	static bool IsActive()
 		{
 			auto ic = GetIC();
 			return ic && ic->IsPseudoFPPActive();
+		}
+
+		// True while the engine's VATS playback / kill cam is running. The
+		// scene-graph hooks must stand down during it - the cinematic moves the
+		// camera around while the camera state stays on k3rdPerson, so pinning
+		// the camera to the head every frame fights the cinematic and crashes.
+		bool IsVATSKillCamActive()
+		{
+			auto* vats = RE::VATS::GetSingleton();
+			if (!vats)
+				return false;
+			return vats->mode.any(RE::VATS::VATS_MODE_ENUM::kPlayback);
 		}
 
 		bool IsBlockingMenuOpen();
@@ -140,7 +152,7 @@ namespace Patch {
 			if (!IsActive())
 				return;
 
-			if (IsBlockingMenuOpen())
+			if (IsBlockingMenuOpen() || IsVATSKillCamActive())
 				return;
 
 			auto* camera = RE::PlayerCamera::GetSingleton();
@@ -248,7 +260,7 @@ namespace Patch {
 
 		static void RestorePseudoRig(RE::NiAVObject* a_this)
 		{
-			if (!IsActive() || IsBlockingMenuOpen())
+			if (!IsActive() || IsBlockingMenuOpen() || IsVATSKillCamActive())
 				return;
 
 			// fast path: cache populated - resolve by pointer comparison only
@@ -520,12 +532,17 @@ namespace Patch {
 		LOG_INFO("ThirdPersonState::Update hook installed successfully");
 	}
 
-	void Hooks::Hook_ThirdPersonStateUpdate(RE::ThirdPersonState* a_this, RE::BSTSmartPointer<RE::TESCameraState>& a_nextState)
+void Hooks::Hook_ThirdPersonStateUpdate(RE::ThirdPersonState* a_this, RE::BSTSmartPointer<RE::TESCameraState>& a_nextState)
 	{
 		Address::Hook::ThirdPersonStateUpdate_Original(a_this, a_nextState);
 
 		auto ic = GetIC();
-		if (!ic || !ic->IsPseudoFPPActive() || PseudoFPP::IsBlockingMenuOpen())
+		if (!ic || !ic->IsPseudoFPPActive() || PseudoFPP::IsBlockingMenuOpen() || PseudoFPP::IsVATSKillCamActive())
+			return;
+
+		// Don't manipulate camera during VATS kill camera or transitions
+		auto playerCamera = RE::PlayerCamera::GetSingleton();
+		if (playerCamera && playerCamera->QCameraEquals(RE::CameraState::kVATS))
 			return;
 
 		if (a_nextState && (a_nextState->id == RE::CameraState::kFirstPerson || a_nextState->id == RE::CameraState::kVATS))
@@ -560,6 +577,11 @@ namespace Patch {
 	void Hooks::InvalidatePseudoCameraCache()
 	{
 		PseudoFPP::InvalidateCache();
+	}
+
+	bool Hooks::IsVATSActive()
+	{
+		return PseudoFPP::IsVATSKillCamActive();
 	}
 
 }

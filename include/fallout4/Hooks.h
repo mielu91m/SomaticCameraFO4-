@@ -19,6 +19,7 @@ namespace Patch {
 		~Hooks();
 
 		static void InvalidatePseudoCameraCache();
+		static bool IsVATSActive();
 
 	private:
 		void Install();

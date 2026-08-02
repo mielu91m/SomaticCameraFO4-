@@ -101,6 +101,7 @@ namespace ImprovedCamera {
 		bool m_PseudoFPPActive = false;
 		bool m_PseudoPushedK3rdPerson = false;
 		bool m_PseudoPendingK3rdPersonPush = false;
+		int m_PseudoReenableFrameCount = 0;
 
 		friend class Events::Observer;
 	};
