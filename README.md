@@ -1,5 +1,5 @@
 Somatic Camera FO4 — Pseudo First-Person Camera for Fallout 4
-Version: Beta V1 - 
+Version: Beta V2 - 
 Compatible with: Fallout 4 (v1.11.221.0)
 (If you have a different version of the game, please test pseudo-camera and let me know if it works!)
 
