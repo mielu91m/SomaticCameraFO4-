@@ -1,7 +1,14 @@
 Somatic Camera FO4 — Pseudo First-Person Camera for Fallout 4
-Version: Beta V2 - 
-Compatible with: Fallout 4 (v1.11.221.0)
-(If you have a different version of the game, please test pseudo-camera and let me know if it works!)
+
+Beta 4:
+
+Fixed Pip-Boy — it now shows up in pseudo camera mode (when a weapon is equipped, the Pip-Boy camera currently falls back to standard 3rd person; still working on a fix);
+Added MCM support (by registrator2000);
+You can now change settings in MCM without exiting the game:
+- fHeightOffset
+- fForwardOffset
+- iToggleKey
+Fixed several reported bugs
 
 Description:
 SomaticCameraFO4 is a beta Fallout 4 mod that adds a pseudo first-person (pseudo FPP) camera system, allowing the player to experience the game world from a third-person perspective with a camera positioned at the character's head height — closely mimicking a true first-person view while retaining third-person situational awareness.
