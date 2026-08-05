@@ -7,6 +7,7 @@
 
 #include "fallout4/Hooks.h"
 
+#include "fallout4/EventsFallout4.h"
 #include "fallout4/Helper.h"
 #include "fallout4/ImprovedCameraFO4.h"
 #include "plugin.h"
@@ -30,9 +31,6 @@ namespace Address::Hook
 	inline REL::Relocation<FuncType> KillActor;
 	inline REL::Relocation<FuncType> NearDistanceIndoorsFix;
 
-	inline REL::Relocation<FuncType> UpdateThirdPerson;
-	inline FuncType UpdateThirdPerson_Original = nullptr;
-
 	inline void (*NiCamera_UpdateWorldData_Original)(RE::NiCamera*, RE::NiUpdateData*) = nullptr;
 
 	using PlayerCameraUpdateFunc = void(__thiscall*)(RE::PlayerCamera*);
@@ -40,6 +38,12 @@ namespace Address::Hook
 
 	using ThirdPersonStateUpdateFunc = void(__thiscall*)(RE::ThirdPersonState*, RE::BSTSmartPointer<RE::TESCameraState>&);
 	inline ThirdPersonStateUpdateFunc ThirdPersonStateUpdate_Original = nullptr;
+
+	using StartPipboyModeFunc = void(__thiscall*)(RE::PlayerCamera*, bool);
+	inline StartPipboyModeFunc StartPipboyMode_Original = nullptr;
+
+	using StopPipboyModeFunc = void(__thiscall*)(RE::PlayerCamera*);
+	inline StopPipboyModeFunc StopPipboyMode_Original = nullptr;
 }
 
 namespace Patch {
@@ -67,25 +71,25 @@ namespace Patch {
 		inline bool g_SceneGraphHooksInstalled = false;
 		inline bool g_NiNodeHooksInstalled = false;
 
-	static bool IsActive()
+		// Frames to keep the scene-graph hooks standing down after the camera
+		// leaves kVATS/kAnimated (kill-cam, power-armor mount/dismount, etc.)
+		// so the engine's tail animation finishes before we pin again.
+		inline int g_VATSCoolDownFrames = 0;
+
+		static bool IsActive()
 		{
 			auto ic = GetIC();
 			return ic && ic->IsPseudoFPPActive();
 		}
 
+		bool IsBlockingMenuOpen();
+
 		// True while the engine's VATS playback / kill cam is running. The
 		// scene-graph hooks must stand down during it - the cinematic moves the
 		// camera around while the camera state stays on k3rdPerson, so pinning
 		// the camera to the head every frame fights the cinematic and crashes.
-		bool IsVATSKillCamActive()
-		{
-			auto* vats = RE::VATS::GetSingleton();
-			if (!vats)
-				return false;
-			return vats->mode.any(RE::VATS::VATS_MODE_ENUM::kPlayback);
-		}
-
-		bool IsBlockingMenuOpen();
+		bool IsVATSKillCamActive();
+		bool IsVATSKillCamActiveDiag();
 
 		static RE::NiAVObject* GetHeadNode()
 		{
@@ -101,6 +105,14 @@ namespace Patch {
 			if (!headNode)
 				return {};
 			return headNode->GetWorldTranslate();
+		}
+
+		static RE::NiMatrix3 ComputeLocalRotateFromWorld(RE::NiAVObject* a_node)
+		{
+			if (!a_node || !a_node->parent)
+				return a_node ? a_node->world.rotate : RE::NiMatrix3{};
+			const RE::NiMatrix3 parentInv = a_node->parent->world.rotate.Transpose();
+			return a_node->world.rotate * parentInv;
 		}
 
 		static RE::NiPoint3 TransformWorldToLocal(const RE::NiMatrix3& a_rot, const RE::NiPoint3& a_vec)
@@ -152,7 +164,7 @@ namespace Patch {
 			if (!IsActive())
 				return;
 
-			if (IsBlockingMenuOpen() || IsVATSKillCamActive())
+			if (IsBlockingMenuOpen() || IsVATSKillCamActiveDiag())
 				return;
 
 			auto* camera = RE::PlayerCamera::GetSingleton();
@@ -216,15 +228,15 @@ namespace Patch {
 			cr->previousWorld.translate = headPos;
 			cr->world.translate = headPos;
 
-			// pin the actual NiCamera to the head; local stays at origin so it
-			// tracks cr exactly
-			if (niCam) {
-				niCam->local.translate = {};
-				niCam->previousWorld.translate = headPos;
-				niCam->world.translate = headPos;
-			}
+		// pin the actual NiCamera to the head; local stays at origin so it
+		// tracks cr exactly
+		if (niCam) {
+			niCam->local.translate = {};
+			niCam->previousWorld.translate = headPos;
+			niCam->world.translate = headPos;
+		}
 
-			static int diagCounter = 0;
+		static int diagCounter = 0;
 			if ((diagCounter++ % 120) == 0) {
 				LOG_INFO("PseudoFPP: cfg h={:.4f} f={:.4f} rawHead=({:.2f},{:.2f},{:.2f}) cam=({:.2f},{:.2f},{:.2f})",
 					heightOffset, forwardOffset,
@@ -251,6 +263,61 @@ namespace Patch {
 			return false;
 		}
 
+		bool IsVATSKillCamActive()
+		{
+			// Stand down while VATS playback runs (shot playback and the death
+			// kill-cam). Note: vats->cameraContext is non-null even outside a
+			// VATS session, so it can NOT be used as a session signal.
+			auto* vats = RE::VATS::GetSingleton();
+			if (vats && vats->mode.any(RE::VATS::VATS_MODE_ENUM::kPlayback))
+				return true;
+			// The engine may switch the camera into kVATS before the VATS
+			// singleton reports the session - cover that window too.
+			auto* camera = RE::PlayerCamera::GetSingleton();
+			const bool inAnimatedState =
+				camera &&
+				(camera->QCameraEquals(RE::CameraState::kVATS) ||
+				 camera->QCameraEquals(RE::CameraState::kAnimated));
+			if (inAnimatedState) {
+				// Reset the cooldown on every frame inside an animated/VATS
+				// state so the grace period starts from the END of the
+				// sequence (power-armor mount/dismount, kill-cam, etc.).
+				g_VATSCoolDownFrames = 150;  // ~2.5s at 60fps
+				return true;
+			}
+
+			// Cooldown: after a kVATS/kAnimated sequence ends (VATS kill-cam,
+			// power-armor station mount/dismount, furniture, cinematic) the
+			// engine keeps animating the camera for a while even though it has
+			// already left kVATS/kAnimated. Pinning the camera to the head
+			// during that tail animation fights the cinematic and can crash,
+			// so keep the hooks standing down for a short grace period.
+			if (g_VATSCoolDownFrames > 0) {
+				g_VATSCoolDownFrames--;
+				return true;
+			}
+			return false;
+		}
+
+		// Diagnostic: log VATS state transitions so we can see whether the
+		// kill-cam is actually caught by the guard above.
+		bool IsVATSKillCamActiveDiag()
+		{
+			static bool lastState = false;
+			const bool now = IsVATSKillCamActive();
+			if (now != lastState) {
+				lastState = now;
+				auto* vats = RE::VATS::GetSingleton();
+				auto* camera = RE::PlayerCamera::GetSingleton();
+				LOG_INFO("VATS state: active={} mode={:08X} camVATS={} camAnimated={}",
+					now ? 1 : 0,
+					vats ? static_cast<std::uint32_t>(vats->mode.underlying()) : 0,
+					camera ? (camera->QCameraEquals(RE::CameraState::kVATS) ? 1 : 0) : 0,
+					camera ? (camera->QCameraEquals(RE::CameraState::kAnimated) ? 1 : 0) : 0);
+			}
+			return now;
+		}
+
 		static void InvalidateCache()
 		{
 			g_NiCamera = nullptr;
@@ -260,13 +327,18 @@ namespace Patch {
 
 		static void RestorePseudoRig(RE::NiAVObject* a_this)
 		{
-			if (!IsActive() || IsBlockingMenuOpen() || IsVATSKillCamActive())
+			if (!IsActive() || IsBlockingMenuOpen() || IsVATSKillCamActiveDiag())
 				return;
 
-			// fast path: cache populated - resolve by pointer comparison only
+			// fast path: cache populated - resolve by pointer comparison only.
+			// Only probe VATS/camera state for actual camera nodes, never for
+			// every scene-graph node (that is the hottest path in the game).
 			if (g_NiCamera || g_CameraRoot) {
-				if (a_this == g_NiCamera || a_this == g_CameraRoot)
+				if (a_this == g_NiCamera || a_this == g_CameraRoot) {
+					if (IsVATSKillCamActiveDiag())
+						return;
 					ForceCameraToHead();
+				}
 				return;
 			}
 
@@ -277,8 +349,11 @@ namespace Patch {
 			auto* tesCam = static_cast<RE::TESCamera*>(camera);
 			g_CameraRoot = tesCam->cameraRoot.get();
 			g_NiCamera = FindNiCamera(tesCam);
-			if (a_this == g_NiCamera || a_this == g_CameraRoot)
+			if (a_this == g_NiCamera || a_this == g_CameraRoot) {
+				if (IsVATSKillCamActiveDiag())
+					return;
 				ForceCameraToHead();
+			}
 		}
 
 		// --- scene graph detours ---
@@ -422,11 +497,15 @@ namespace Patch {
 
 		LOG_INFO("Installing hooks...");
 
-		HookUpdateThirdPerson();
 		HookPlayerCameraUpdate();
 		HookNiCameraUpdateWorldData();
 		HookThirdPersonStateUpdate();
+		HookPipboyMode();
 		PseudoFPP::InstallSceneGraphHooks();
+
+		// Register the MenuOpenCloseEvent handler so pseudo is disabled for
+		// blocking menus (Pip-Boy, VATS, etc.) and re-enabled afterwards.
+		Events::Observer::Get()->Register();
 
 		LOG_INFO("Finished installing hooks.");
 	}
@@ -440,42 +519,6 @@ namespace Patch {
 	{
 		LOG_INFO("Resolving hook addresses...");
 		LOG_INFO("Finished resolving hook addresses.");
-	}
-
-	void Hooks::HookUpdateThirdPerson()
-	{
-		auto& trampoline = Address::Hook::UpdateThirdPerson;
-		trampoline = REL::Relocation<Address::Hook::FuncType>(REL::ID(50841));
-
-		if (!trampoline) {
-			LOG_WARN("UpdateThirdPerson hook: failed to resolve address (ID 50841)");
-			return;
-		}
-
-		MH_STATUS status = MH_CreateHook(
-			reinterpret_cast<LPVOID>(trampoline.address()),
-			reinterpret_cast<LPVOID>(&Patch::Hooks::Hook_UpdateThirdPerson),
-			reinterpret_cast<LPVOID*>(&Address::Hook::UpdateThirdPerson_Original));
-
-		if (status != MH_OK) {
-			LOG_WARN("UpdateThirdPerson hook: MH_CreateHook failed ({})", static_cast<uint32_t>(status));
-			return;
-		}
-
-		status = MH_EnableHook(reinterpret_cast<LPVOID>(trampoline.address()));
-		if (status != MH_OK) {
-			LOG_WARN("UpdateThirdPerson hook: MH_EnableHook failed ({})", static_cast<uint32_t>(status));
-			return;
-		}
-
-		LOG_INFO("UpdateThirdPerson hook installed successfully");
-	}
-
-	void Hooks::Hook_UpdateThirdPerson(RE::PlayerCamera* camera, bool weaponDrawn)
-	{
-		// pseudo head anchoring is handled by PseudoFPP::ForceCameraToHead
-		// from the state/scene-graph hooks - keep this one a clean passthrough
-		Address::Hook::UpdateThirdPerson_Original(camera, weaponDrawn);
 	}
 
 	void Hooks::HookPlayerCameraUpdate()
@@ -502,7 +545,7 @@ namespace Patch {
 		// pseudo head position so the engine's own TPP math can't win
 		Address::Hook::PlayerCameraUpdate_Original(a_this);
 
-		if (!pseudoActive || PseudoFPP::IsBlockingMenuOpen())
+		if (!pseudoActive || PseudoFPP::IsBlockingMenuOpen() || PseudoFPP::IsVATSKillCamActiveDiag())
 			return;
 
 		auto* tesCam = static_cast<RE::TESCamera*>(a_this);
@@ -532,23 +575,118 @@ namespace Patch {
 		LOG_INFO("ThirdPersonState::Update hook installed successfully");
 	}
 
-void Hooks::Hook_ThirdPersonStateUpdate(RE::ThirdPersonState* a_this, RE::BSTSmartPointer<RE::TESCameraState>& a_nextState)
+	void Hooks::Hook_ThirdPersonStateUpdate(RE::ThirdPersonState* a_this, RE::BSTSmartPointer<RE::TESCameraState>& a_nextState)
 	{
+		// BEFORE calling the original: if Pip-Boy is active, prevent the
+		// engine from transitioning away from the Pip-Boy camera state.
+		// When a weapon is drawn the engine's ThirdPersonState::Update
+		// unconditionally sets a_nextState to kFirstPerson, which would
+		// overwrite the Pip-Boy camera every frame ("constantly overwritten").
+		// Clear a_nextState so the camera stays in its current (Pip-Boy) state.
+		auto* camera = RE::PlayerCamera::GetSingleton();
+		if (camera && camera->pipboyMode) {
+			a_nextState = nullptr;
+			return;
+		}
+
 		Address::Hook::ThirdPersonStateUpdate_Original(a_this, a_nextState);
 
 		auto ic = GetIC();
-		if (!ic || !ic->IsPseudoFPPActive() || PseudoFPP::IsBlockingMenuOpen() || PseudoFPP::IsVATSKillCamActive())
-			return;
-
-		// Don't manipulate camera during VATS kill camera or transitions
-		auto playerCamera = RE::PlayerCamera::GetSingleton();
-		if (playerCamera && playerCamera->QCameraEquals(RE::CameraState::kVATS))
+		if (!ic || !ic->IsPseudoFPPActive() || PseudoFPP::IsBlockingMenuOpen() || PseudoFPP::IsVATSKillCamActiveDiag())
 			return;
 
 		if (a_nextState && (a_nextState->id == RE::CameraState::kFirstPerson || a_nextState->id == RE::CameraState::kVATS))
 			return;
 
 		PseudoFPP::ForceCameraToHead();
+	}
+
+	void Hooks::HookPipboyMode()
+	{
+		// Hook StartPipboyMode and StopPipboyMode to disable/enable pseudo
+		// at the correct time — BEFORE the engine sets up the Pip-Boy camera
+		// (not after, as MenuOpenCloseEvent does). This prevents pseudo's
+		// scene-graph/camera hooks from interfering with the Pip-Boy camera
+		// state setup, which is the root cause of the weapon-drawn Pip-Boy
+		// conflict.
+		void* startAddr = reinterpret_cast<void*>(REL::ID(RE::ID::PlayerCamera::StartPipboyMode).address());
+		if (!startAddr) {
+			LOG_WARN("StartPipboyMode hook: failed to resolve address");
+			return;
+		}
+		if (MH_CreateHook(startAddr, reinterpret_cast<void*>(&Hook_StartPipboyMode),
+			reinterpret_cast<void**>(&Address::Hook::StartPipboyMode_Original)) != MH_OK) {
+			LOG_WARN("StartPipboyMode hook: failed to create hook");
+			return;
+		}
+		MH_EnableHook(startAddr);
+		LOG_INFO("StartPipboyMode hook installed successfully");
+
+		void* stopAddr = reinterpret_cast<void*>(REL::ID(RE::ID::PlayerCamera::StopPipboyMode).address());
+		if (!stopAddr) {
+			LOG_WARN("StopPipboyMode hook: failed to resolve address");
+			return;
+		}
+		if (MH_CreateHook(stopAddr, reinterpret_cast<void*>(&Hook_StopPipboyMode),
+			reinterpret_cast<void**>(&Address::Hook::StopPipboyMode_Original)) != MH_OK) {
+			LOG_WARN("StopPipboyMode hook: failed to create hook");
+			return;
+		}
+		MH_EnableHook(stopAddr);
+		LOG_INFO("StopPipboyMode hook installed successfully");
+	}
+
+	void Hooks::Hook_StartPipboyMode(RE::PlayerCamera* a_this, bool a_forcePipboyModeCamera)
+	{
+		// Disable pseudo BEFORE the engine sets up the Pip-Boy camera, so
+		// no pseudo hooks (ForceCameraToHead, scene-graph hooks) interfere
+		// with StartPipboyMode()'s camera state transition.
+		auto ic = GetIC();
+		const bool pseudoWasActive = ic && ic->IsPseudoFPPActive();
+		if (pseudoWasActive) {
+			ic->m_PseudoActiveBeforePipboy = true;
+			LOG_INFO("Pseudo-FPP: StartPipboyMode -> disabling pseudo (a_forcePipboyModeCamera={})", a_forcePipboyModeCamera ? 1 : 0);
+			ic->SetPseudoFPPActive(false);
+		} else {
+			ic->m_PseudoActiveBeforePipboy = false;
+		}
+
+		// If a weapon is drawn, the camera is currently in k3rdPerson
+		// (pseudo's state). The engine's StartPipboyMode expects to
+		// transition from kFirstPerson (weapon-drawn first-person) to
+		// Pip-Boy, which properly sheathes the weapon and shows the
+		// Pip-Boy at the correct distance. If we leave the camera in
+		// k3rdPerson, the Pip-Boy appears tiny (rendered from third-person
+		// distance). Switch to kFirstPerson first, BEFORE the engine's
+		// pipboy transition takes over.
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (player && Helper::IsWeaponDrawn(player)) {
+			RE::PlayerCamera* pc = RE::PlayerCamera::GetSingleton();
+			if (pc && pc->GetState(RE::CameraState::kFirstPerson))
+				pc->SetState(pc->GetState(RE::CameraState::kFirstPerson).get());
+			LOG_INFO("Pseudo-FPP: StartPipboyMode -> set kFirstPerson (weapon drawn) for pipboy transition");
+		}
+
+		Address::Hook::StartPipboyMode_Original(a_this, a_forcePipboyModeCamera);
+	}
+
+	void Hooks::Hook_StopPipboyMode(RE::PlayerCamera* a_this)
+	{
+		Address::Hook::StopPipboyMode_Original(a_this);
+
+		// Re-enable pseudo only if it was active when Pip-Boy opened.
+		// The re-enable is deferred via m_PseudoPendingK3rdPersonPush so
+		// k3rdPerson is pushed at a safe frame in PerFrameUpdate, not here.
+		auto ic = GetIC();
+		if (ic && ic->m_PseudoActiveBeforePipboy && !ic->IsPseudoFPPActive()) {
+			LOG_INFO("Pseudo-FPP: StopPipboyMode -> re-enabling pseudo");
+			ic->SetPseudoFPPActive(true);
+			ic->m_PseudoPendingK3rdPersonPush = true;
+			ic->m_PseudoPushedK3rdPerson = false;
+			ic->m_PseudoReenableFrameCount = 30;  // ~0.5s at 60fps
+		}
+		if (ic)
+			ic->m_PseudoActiveBeforePipboy = false;
 	}
 
 	void Hooks::HookNiCameraUpdateWorldData()

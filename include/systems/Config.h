@@ -41,6 +41,12 @@ namespace Systems {
 		const std::string& ProfilePath() const { return m_ProfilePath; };
 		const std::string& FileName() const { return m_FileName; };
 
+		// Runtime reload of F4MCM-saved settings (Data\MCM\Settings\<Name>.ini).
+		// Detects external writes (MCM menu Apply) and updates the PseudoFPP
+		// values so tweaks take effect without restarting the game.
+		void ReloadMCMSettings();
+		void ReloadMCMKeybinds();
+
 	public:
 		const Settings::ModuleData& ModuleData() const { return m_ModuleData; };
 		const Settings::General& General() const { return m_General; };
@@ -55,9 +61,18 @@ namespace Systems {
 		const Settings::PseudoFPP& PseudoFPP() const { return m_PseudoFPP; };
 		const Settings::Logging& Logging() const { return m_Logging; };
 
+		// Toggle key used by the pseudo first-person camera. Prefers the
+		// key assigned via the F4MCM hotkey control (Data\MCM\Settings\Keybinds.json),
+		// falling back to the iToggleKey mod setting.
+		std::int32_t ToggleKey() const { return m_MCMToggleKey > 0 ? m_MCMToggleKey : m_PseudoFPP.iToggleKey; };
+
 	private:
 		bool ReadIni(std::string& name);
 		void WriteIni(std::string& name, bool updateMain = false);
+		void ReloadPseudoFPP();
+		void UpdateMCMSettingsWriteTime();
+		void UpdateMCMKeybindsWriteTime();
+		std::int32_t ReadMCMToggleKey();
 
 	private:
 		bool m_Initialized = false;
@@ -68,6 +83,12 @@ namespace Systems {
 		std::string m_Path{};
 		std::string m_FontPath{};
 		std::string m_ProfilePath{};
+
+		std::string m_MCMSettingsPath{};
+		std::uint64_t m_MCMSettingsLastWrite = 0;
+		std::string m_MCMKeybindsPath{};
+		std::uint64_t m_MCMKeybindsLastWrite = 0;
+		std::int32_t m_MCMToggleKey = 0;
 
 	private:
 		Settings::ModuleData m_ModuleData{};

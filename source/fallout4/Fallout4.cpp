@@ -9,7 +9,6 @@
 
 #include "fallout4/Fallout4.h"
 
-#include "fallout4/EventsFallout4.h"
 #include "fallout4/Hooks.h"
 #include "fallout4/ImprovedCameraFO4.h"
 #include "plugin.h"
@@ -33,8 +32,6 @@ namespace Patch {
 	{
 		m_Hooks = std::make_unique<Hooks>();
 		m_Camera = std::make_unique<ImprovedCamera::ImprovedCameraFO4>();
-
-		Events::Observer::Get()->Register();
 
 		m_Hooks->Install();
 		m_OnLoaded = true;

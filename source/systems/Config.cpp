@@ -52,6 +52,57 @@ namespace Systems {
 				LOG_WARN("Profile read failed: {}", profileName.c_str());
 		}
 
+		// F4MCM integration: if F4MCM is installed, read settings from
+		// Data\MCM\Settings\SomaticCameraFO4.ini (overrides INI file).
+		// Try absolute path first (derived from plugin path), then fallback to relative.
+		std::string pluginPath = plugin->Path();
+		std::string dataPath = pluginPath;
+		size_t f4sePos = dataPath.rfind("F4SE\\Plugins\\");
+		if (f4sePos != std::string::npos)
+			dataPath = dataPath.substr(0, f4sePos);
+		std::string mcmSettings = dataPath + "MCM\\Settings\\SomaticCameraFO4.ini";
+		m_MCMSettingsPath = mcmSettings;
+		LOG_INFO("Config: checking MCM settings at '{}'", mcmSettings);
+		if (GetFileAttributesA(mcmSettings.c_str()) != INVALID_FILE_ATTRIBUTES)
+		{
+			if (!ReadIni(mcmSettings))
+				LOG_WARN("MCM settings read failed: {}", mcmSettings.c_str());
+			else
+				LOG_INFO("Config: using MCM settings from '{}'", mcmSettings.c_str());
+		}
+		else {
+			// Fallback: try relative path
+			std::string mcmSettingsRel = "Data\\MCM\\Settings\\SomaticCameraFO4.ini";
+			LOG_INFO("Config: MCM settings not found at '{}', trying relative path '{}'", mcmSettings, mcmSettingsRel);
+			if (GetFileAttributesA(mcmSettingsRel.c_str()) != INVALID_FILE_ATTRIBUTES)
+			{
+				m_MCMSettingsPath = mcmSettingsRel;
+				if (!ReadIni(mcmSettingsRel))
+					LOG_WARN("MCM settings read failed (relative): {}", mcmSettingsRel.c_str());
+				else
+					LOG_INFO("Config: using MCM settings from '{}' (relative)", mcmSettingsRel.c_str());
+			}
+		}
+
+		UpdateMCMSettingsWriteTime();
+		m_MCMKeybindsPath = dataPath + "MCM\\Settings\\Keybinds.json";
+		if (GetFileAttributesA(m_MCMKeybindsPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+		{
+			// Fallback: try relative path
+			std::string mcmKeybindsRel = "Data\\MCM\\Settings\\Keybinds.json";
+			if (GetFileAttributesA(mcmKeybindsRel.c_str()) != INVALID_FILE_ATTRIBUTES)
+			{
+				m_MCMKeybindsPath = mcmKeybindsRel;
+				LOG_INFO("Config: using MCM keybinds from relative path '{}'", mcmKeybindsRel);
+			}
+		}
+		UpdateMCMKeybindsWriteTime();
+		ReadMCMToggleKey();
+		if (m_MCMToggleKey > 0)
+			LOG_INFO("Config: MCM toggle key from Keybinds.json = {} (overrides INI iToggleKey)", m_MCMToggleKey);
+		else
+			LOG_INFO("Config: no MCM toggle key found, falling back to INI iToggleKey = {}", m_PseudoFPP.iToggleKey);
+
 		LOG_INFO("Config: using '{}' (PSEUDOFPP height={:.4f} forward={:.4f})",
 			m_FileName.c_str(), m_PseudoFPP.fHeightOffset, m_PseudoFPP.fForwardOffset);
 	}
@@ -349,6 +400,182 @@ namespace Systems {
 
 			file.write(ini);
 		}
+	}
+
+	void Config::UpdateMCMSettingsWriteTime()
+	{
+		WIN32_FILE_ATTRIBUTE_DATA data{};
+		if (!GetFileAttributesExA(m_MCMSettingsPath.c_str(), GetFileExInfoStandard, &data))
+		{
+			m_MCMSettingsLastWrite = 0;
+			return;
+		}
+
+		m_MCMSettingsLastWrite = (static_cast<std::uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
+			static_cast<std::uint64_t>(data.ftLastWriteTime.dwLowDateTime);
+	}
+
+	void Config::ReloadPseudoFPP()
+	{
+		try
+		{
+			mINI::INIFile file(m_MCMSettingsPath.c_str());
+			mINI::INIStructure ini;
+			if (!file.read(ini))
+				return;
+
+			auto getFloat = [&ini](const std::string& sec, const std::string& key, float def) {
+				auto v = ini.get(sec).get(key);
+				return v.empty() ? def : std::stof(v);
+			};
+			auto getInt = [&ini](const std::string& sec, const std::string& key, int def) {
+				auto v = ini.get(sec).get(key);
+				return v.empty() ? def : std::stoi(v);
+			};
+
+			m_PseudoFPP.fHeightOffset = getFloat("PSEUDOFPP", "fHeightOffset", m_PseudoFPP.fHeightOffset);
+			m_PseudoFPP.fForwardOffset = getFloat("PSEUDOFPP", "fForwardOffset", m_PseudoFPP.fForwardOffset);
+			m_PseudoFPP.iToggleKey = getInt("PSEUDOFPP", "iToggleKey", m_PseudoFPP.iToggleKey);
+			m_PseudoFPP.iADSKey = getInt("PSEUDOFPP", "iADSKey", m_PseudoFPP.iADSKey);
+			m_PseudoFPP.iGamepadTriggerThreshold = getInt("PSEUDOFPP", "iGamepadTriggerThreshold", m_PseudoFPP.iGamepadTriggerThreshold);
+		}
+		catch (...)
+		{
+			LOG_WARN("MCM settings reload failed: {}", m_MCMSettingsPath.c_str());
+		}
+	}
+
+	void Config::ReloadMCMSettings()
+	{
+		if (m_MCMSettingsPath.empty())
+			return;
+
+		std::uint64_t newWriteTime = 0;
+		WIN32_FILE_ATTRIBUTE_DATA data{};
+		if (GetFileAttributesExA(m_MCMSettingsPath.c_str(), GetFileExInfoStandard, &data))
+		{
+			newWriteTime = (static_cast<std::uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
+				static_cast<std::uint64_t>(data.ftLastWriteTime.dwLowDateTime);
+		}
+
+		if (newWriteTime == 0 || newWriteTime == m_MCMSettingsLastWrite)
+			return;
+
+		m_MCMSettingsLastWrite = newWriteTime;
+		ReloadPseudoFPP();
+
+		LOG_INFO("Config: MCM settings reloaded (PSEUDOFPP height={:.4f} forward={:.4f} toggleKey={})",
+			m_PseudoFPP.fHeightOffset, m_PseudoFPP.fForwardOffset, m_PseudoFPP.iToggleKey);
+	}
+
+	void Config::UpdateMCMKeybindsWriteTime()
+	{
+		WIN32_FILE_ATTRIBUTE_DATA data{};
+		if (!GetFileAttributesExA(m_MCMKeybindsPath.c_str(), GetFileExInfoStandard, &data))
+		{
+			m_MCMKeybindsLastWrite = 0;
+			return;
+		}
+
+		m_MCMKeybindsLastWrite = (static_cast<std::uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
+			static_cast<std::uint64_t>(data.ftLastWriteTime.dwLowDateTime);
+	}
+
+	std::int32_t Config::ReadMCMToggleKey()
+	{
+		// Data\MCM\Settings\Keybinds.json is written by F4MCM whenever the MCM
+		// menu is closed with modified keybinds. Find the entry for our keybind
+		// ("togglePseudo") and read its keycode into m_MCMToggleKey.
+		std::ifstream file(m_MCMKeybindsPath);
+		if (!file.is_open()) {
+			LOG_INFO("Config: Keybinds.json not found at '{}'", m_MCMKeybindsPath.c_str());
+			m_MCMToggleKey = 0;
+			return 0;
+		}
+
+		try {
+			std::stringstream buffer;
+			buffer << file.rdbuf();
+			std::string json = buffer.str();
+
+			// Locate the keybind object for our mod. Format:
+			// {"keycode":115,"modifiers":0,"modName":"SomaticCameraFO4","id":"togglePseudo"}
+			// Search for the id field, then read the keycode within the same object.
+			const std::string idKey = "\"id\":\"togglePseudo\"";
+			auto idPos = json.find(idKey);
+			if (idPos == std::string::npos) {
+				LOG_WARN("Config: 'togglePseudo' id not found in Keybinds.json");
+				m_MCMToggleKey = 0;
+				return 0;
+			}
+
+			// Find the enclosing object braces around the id field.
+			auto openBrace = json.rfind('{', idPos);
+			auto closeBrace = json.find('}', idPos);
+			if (openBrace == std::string::npos || closeBrace == std::string::npos) {
+				LOG_WARN("Config: malformed object braces around togglePseudo keybind");
+				m_MCMToggleKey = 0;
+				return 0;
+			}
+
+			std::string object = json.substr(openBrace, closeBrace - openBrace + 1);
+
+			// Verify it is our mod's entry.
+			if (object.find("\"modName\":\"SomaticCameraFO4\"") == std::string::npos) {
+				LOG_WARN("Config: togglePseudo keybind entry has wrong modName");
+				m_MCMToggleKey = 0;
+				return 0;
+			}
+
+			const std::string keyCodeKey = "\"keycode\":";
+			auto keyCodePos = object.find(keyCodeKey);
+			if (keyCodePos == std::string::npos) {
+				LOG_WARN("Config: 'keycode' field not found in togglePseudo keybind entry");
+				m_MCMToggleKey = 0;
+				return 0;
+			}
+
+			keyCodePos += keyCodeKey.size();
+			auto valueEnd = object.find_first_not_of("0123456789", keyCodePos);
+			if (valueEnd == keyCodePos) {
+				LOG_WARN("Config: keycode value is empty or invalid in togglePseudo keybind");
+				m_MCMToggleKey = 0;
+				return 0;
+			}
+
+			std::int32_t keyCode = std::stoi(object.substr(keyCodePos, valueEnd - keyCodePos));
+			m_MCMToggleKey = keyCode;
+			LOG_INFO("Config: MCM toggle key from Keybinds.json = {}", keyCode);
+			return keyCode;
+		}
+		catch (...)
+		{
+			LOG_WARN("Config: failed to parse MCM Keybinds.json at '{}'", m_MCMKeybindsPath.c_str());
+			m_MCMToggleKey = 0;
+			return 0;
+		}
+	}
+
+	void Config::ReloadMCMKeybinds()
+	{
+		if (m_MCMKeybindsPath.empty())
+			return;
+
+		std::uint64_t newWriteTime = 0;
+		WIN32_FILE_ATTRIBUTE_DATA data{};
+		if (GetFileAttributesExA(m_MCMKeybindsPath.c_str(), GetFileExInfoStandard, &data))
+		{
+			newWriteTime = (static_cast<std::uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
+				static_cast<std::uint64_t>(data.ftLastWriteTime.dwLowDateTime);
+		}
+
+		if (newWriteTime == 0 || newWriteTime == m_MCMKeybindsLastWrite)
+			return;
+
+		m_MCMKeybindsLastWrite = newWriteTime;
+		ReadMCMToggleKey();
+		LOG_INFO("Config: MCM keybinds reloaded from '{}' (toggleKey={})",
+			m_MCMKeybindsPath.c_str(), m_MCMToggleKey);
 	}
 
 }

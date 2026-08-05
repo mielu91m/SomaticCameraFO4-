@@ -60,21 +60,6 @@ namespace ImprovedCamera {
 		return false;
 	}
 
-	// True if k3rdPerson is already on the camera's return stack
-	// (tempReturnStates) - i.e. pseudo's push survived the engine's
-	// VATS/kill-cam transition. Used to make the pending push idempotent so
-	// rapid back-to-back VATS cycles can't accumulate duplicate entries.
-	static bool IsK3rdPersonOnCameraStack(RE::PlayerCamera* a_camera)
-	{
-		if (!a_camera)
-			return false;
-		for (const auto& statePtr : a_camera->tempReturnStates) {
-			if (statePtr && statePtr->id == RE::CameraState::k3rdPerson)
-				return true;
-		}
-		return false;
-	}
-
 	ImprovedCameraFO4::ImprovedCameraFO4()
 	{
 		m_pluginConfig = DLLMain::Plugin::Get()->Config();
@@ -95,6 +80,82 @@ namespace ImprovedCamera {
 			Patch::Hooks::InvalidatePseudoCameraCache();
 			m_PseudoPushedK3rdPerson = false;
 			m_PseudoPendingK3rdPersonPush = false;
+		}
+	}
+
+	void ImprovedCameraFO4::PopPseudoK3rdPerson()
+	{
+		auto playerCamera = RE::PlayerCamera::GetSingleton();
+		if (!playerCamera)
+			return;
+
+		// Remove pseudo's k3rdPerson from the camera return stack.
+		// The engine may have pushed additional k3rdPerson copies on top
+		// (e.g. weapon-drawn camera pushes kFirstPerson, which re-pushes
+		// the current k3rdPerson). A single PopState is not enough.
+		// Also pop kIronSights entries: when a weapon is drawn the engine
+		// may push kIronSights on top of pseudo's k3rdPerson, and we
+		// need to clear those too so the Pip-Boy gets a clean state.
+		// Phase 1: pop every k3rdPerson or kIronSights that is the top
+		// of the return stack (engine duplicates). Phase 2: if current
+		// is still k3rdPerson or kIronSights (pseudo's own push or
+		// engine's weapon-drawn state), pop that too.
+		int popped = 0;
+		while (popped < 16 && !playerCamera->tempReturnStates.empty()) {
+			auto id = playerCamera->tempReturnStates.back()->id;
+			if (id != RE::CameraState::k3rdPerson && id != RE::CameraState::kIronSights)
+				break;
+			playerCamera->PopState();
+			popped++;
+		}
+		while (popped < 16 &&
+			(playerCamera->QCameraEquals(RE::CameraState::k3rdPerson) ||
+			 playerCamera->QCameraEquals(RE::CameraState::kIronSights))) {
+			playerCamera->PopState();
+			popped++;
+		}
+		if (popped > 0)
+			LOG_INFO("Pseudo-FPP: popped {}x k3rdPerson/kIronSights from return stack", popped);
+	}
+
+	void ImprovedCameraFO4::RestorePseudoK3rdPerson()
+	{
+		auto playerCamera = RE::PlayerCamera::GetSingleton();
+		if (!playerCamera)
+			return;
+
+		// The engine can drop the pseudo camera into real FPP (weapon-drawn
+		// camera, ADS end) by either SetState(kFirstPerson) or
+		// PushState(kFirstPerson). In the PushState case it pushed pseudo's
+		// k3rdPerson onto the return stack, so a SetState back to k3rdPerson
+		// would leave a stale duplicate k3rdPerson on the stack (which then
+		// breaks Pip-Boy). Pop it back off instead so the stack stays
+		// balanced: currentState = k3rdPerson, top of return stack = k3rdPerson.
+		// Also handle kIronSights: when a weapon is drawn and the player is
+		// in ADS, the engine may push kIronSights on the stack. Pop it so
+		// the camera properly returns to pseudo's k3rdPerson.
+		//
+		// CRITICAL: pop ALL stale entries, not just one. When a weapon is
+		// drawn every frame the engine pushes kFirstPerson (pushing current
+		// k3rdPerson onto the return stack), and RestorePseudoK3rdPerson
+		// only pops one per frame — stale entries accumulate and corrupt
+		// the stack, which prevents the engine from transitioning to Pip-Boy
+		// camera later (hands/weapon overlay blocks Pip-Boy UI).
+		bool pushed = false;
+		while (!playerCamera->tempReturnStates.empty()) {
+			auto id = playerCamera->tempReturnStates.back()->id;
+			if (id == RE::CameraState::k3rdPerson || id == RE::CameraState::kIronSights) {
+				playerCamera->PopState();
+				pushed = true;
+			} else {
+				break;
+			}
+		}
+		if (pushed) {
+			LOG_INFO("Pseudo-FPP: restored k3rdPerson via PopState (popped stale FPP/ADS entries)");
+		} else {
+			playerCamera->SetState(playerCamera->GetState(RE::CameraState::k3rdPerson).get());
+			LOG_INFO("Pseudo-FPP: restored k3rdPerson via SetState");
 		}
 	}
 
@@ -672,61 +733,29 @@ namespace ImprovedCamera {
 		LOG_INFO("PerFrameUpdate registered successfully");
 	}
 
-void ImprovedCameraFO4::PerFrameUpdate()
+	void ImprovedCameraFO4::PerFrameUpdate()
 	{
 		auto playerCamera = RE::PlayerCamera::GetSingleton();
 		if (!playerCamera)
 			return;
 
-		// Deferred pseudo re-activation after a blocking menu (e.g. VATS)
-		// closed. Waits until the engine's kill-cam / exit transition has
-		// finished, then re-enables pseudo from a safe frame.
-		if (m_PseudoReenableFrameCount > 0) {
-			// Only count down while the camera has settled into a stable
-			// gameplay state. During the kill cam the engine keeps the camera
-			// in kVATS/kPCTransition, so we keep resetting and never re-enable
-			// pseudo until the cinematic fully ends.
-			const bool isStableGameplayState =
-				playerCamera->QCameraEquals(RE::CameraState::k3rdPerson) ||
-				playerCamera->QCameraEquals(RE::CameraState::kFirstPerson) ||
-				playerCamera->QCameraEquals(RE::CameraState::kIronSights);
-			if (!IsBlockingMenuOpen() &&
-				!Patch::Hooks::IsVATSActive() &&
-				!playerCamera->QCameraEquals(RE::CameraState::kVATS) &&
-				!playerCamera->QCameraEquals(RE::CameraState::kPCTransition) &&
-				isStableGameplayState) {
-				m_PseudoReenableFrameCount--;
-				if (m_PseudoReenableFrameCount <= 0) {
-					auto* vats = RE::VATS::GetSingleton();
-					bool vatsPlayback = vats && vats->mode.any(RE::VATS::VATS_MODE_ENUM::kPlayback);
-					LOG_INFO("Pseudo-FPP: deferred re-activation complete — isVATS={}, vatsPlayback={}, cameraState={}",
-						playerCamera->QCameraEquals(RE::CameraState::kVATS),
-						vatsPlayback,
-						playerCamera->QCameraEquals(RE::CameraState::kVATS) ? "kVATS" :
-						playerCamera->QCameraEquals(RE::CameraState::k3rdPerson) ? "k3rdPerson" :
-						playerCamera->QCameraEquals(RE::CameraState::kFirstPerson) ? "kFirstPerson" :
-						playerCamera->QCameraEquals(RE::CameraState::kIronSights) ? "kIronSights" :
-						playerCamera->QCameraEquals(RE::CameraState::kPCTransition) ? "kPCTransition" :
-						"other");
-					SetPseudoFPPActive(true);
-					LOG_INFO("Pseudo-FPP: deferred re-activation complete");
-				}
-			} else {
-				// still transitioning - keep waiting (reset so we wait a full delay)
-				m_PseudoReenableFrameCount = 30;
-			}
+		// Refresh F4MCM-saved settings periodically so MCM tweaks take effect
+		// without a game restart. Throttled to every ~60 frames (1s at 60fps).
+		static int mcmReloadFrame = 0;
+		if (m_pluginConfig && ++mcmReloadFrame >= 60)
+		{
+			mcmReloadFrame = 0;
+			m_pluginConfig->ReloadMCMSettings();
+			m_pluginConfig->ReloadMCMKeybinds();
 		}
 
-	// Early exit if engine is in VATS or any blocking menu - don't manipulate
-	// camera state during these critical transitions (kill camera, etc.)
-	if (playerCamera->QCameraEquals(RE::CameraState::kVATS) || Patch::Hooks::IsVATSActive() || IsBlockingMenuOpen())
-		return;
 
-		// toggle key (default VK_F4 = 115), read from config
-		const int toggleKey = m_pluginConfig->PseudoFPP().iToggleKey;
+		// toggle key (default VK_F4 = 115), read from config; the F4MCM hotkey
+		// control (Keybinds.json) takes precedence over the iToggleKey setting.
+		const int toggleKey = m_pluginConfig->ToggleKey();
 		bool currentKeyState = (GetAsyncKeyState(toggleKey) & 0x8000) != 0;
 		static bool lastKeyState = false;
-		if (currentKeyState && !lastKeyState) {
+		if (currentKeyState && !lastKeyState && !IsBlockingMenuOpen()) {
 			m_PseudoFPPActive = !m_PseudoFPPActive;
 			LOG_INFO("Pseudo-FPP {} (key {} toggle)", m_PseudoFPPActive ? "enabled" : "disabled", toggleKey);
 
@@ -734,21 +763,24 @@ void ImprovedCameraFO4::PerFrameUpdate()
 				const bool isFurnitureNow = playerCamera->QCameraEquals(RE::CameraState::kFurniture);
 				const bool isTransitionNow = playerCamera->QCameraEquals(RE::CameraState::kPCTransition);
 				const bool isThirdPersonNow = playerCamera->QCameraEquals(RE::CameraState::k3rdPerson);
-				if (!isFurnitureNow && !isTransitionNow && !isThirdPersonNow && !IsK3rdPersonOnCameraStack(playerCamera)) {
+				if (!isFurnitureNow && !isTransitionNow && !isThirdPersonNow) {
 					playerCamera->PushState(RE::CameraState::k3rdPerson);
 					m_PseudoPushedK3rdPerson = true;
 					LOG_INFO("Pseudo-FPP: forced third-person camera state");
 				}
 				else {
-					// already in k3rdPerson, or k3rdPerson still on the return
-					// stack from a prior menu cycle - treat as already pushed
-					m_PseudoPushedK3rdPerson = isThirdPersonNow || IsK3rdPersonOnCameraStack(playerCamera);
+					m_PseudoPushedK3rdPerson = false;
 					LOG_INFO("Pseudo-FPP: enabled in {} camera state", isFurnitureNow ? "furniture" : isTransitionNow ? "transition" : "third-person");
 				}
 			}
 			else {
 				if (m_PseudoPushedK3rdPerson) {
-					playerCamera->PopState();
+					// Pop EVERY k3rdPerson pseudo pushed. A weapon drawn while
+					// pseudo is active makes the engine push its own kFirstPerson
+					// on top of pseudo's k3rdPerson, duplicating k3rdPerson on
+					// the return stack, so a single PopState would leave the
+					// camera stuck in third person after toggling off.
+					PopPseudoK3rdPerson();
 					LOG_INFO("Pseudo-FPP: restored previous camera state");
 				}
 				else {
@@ -768,89 +800,109 @@ void ImprovedCameraFO4::PerFrameUpdate()
 		!IsBlockingMenuOpen() && !Patch::Hooks::IsVATSActive()) {
 		const bool isFurnitureNow = playerCamera->QCameraEquals(RE::CameraState::kFurniture);
 		const bool isTransitionNow = playerCamera->QCameraEquals(RE::CameraState::kPCTransition);
-		const bool isThirdPersonNow = playerCamera->QCameraEquals(RE::CameraState::k3rdPerson);
-		const bool isK3rdPersonOnStack = IsK3rdPersonOnCameraStack(playerCamera);
-		LOG_INFO("Pseudo-FPP: pending push check - isFPP={}, isTPP={}, isFurniture={}, isTransition={}, k3rdOnStack={}",
-			playerCamera->QCameraEquals(RE::CameraState::kFirstPerson),
-			isThirdPersonNow,
-			isFurnitureNow, isTransitionNow, isK3rdPersonOnStack);
-		if (!isFurnitureNow && !isTransitionNow) {
-			// Idempotent push. Only re-push k3rdPerson if the engine left us in
-			// a non-TPP state AND pseudo's k3rdPerson is not already sitting on
-			// the return stack. Never PopState here - after a kill cam the engine
-			// may have already popped pseudo's k3rdPerson and restored the base
-			// state, so a PopState would pop the BASE state and corrupt the stack
-			// (player freezes). Checking the actual stack prevents rapid
-			// back-to-back VATS cycles from stacking duplicate k3rdPerson entries.
-			if (!isThirdPersonNow && !isK3rdPersonOnStack) {
-				playerCamera->PushState(RE::CameraState::k3rdPerson);
-				LOG_INFO("Pseudo-FPP: pending push k3rdPerson (engine left non-TPP state)");
-			} else {
-				LOG_INFO("Pseudo-FPP: pending push skipped — isThirdPersonNow={}, isK3rdPersonOnStack={}, isVATSActive={}, cameraState={}",
-					isThirdPersonNow, isK3rdPersonOnStack,
-					Patch::Hooks::IsVATSActive(),
-					playerCamera->QCameraEquals(RE::CameraState::kVATS) ? "kVATS" :
-					playerCamera->QCameraEquals(RE::CameraState::k3rdPerson) ? "k3rdPerson" :
-					playerCamera->QCameraEquals(RE::CameraState::kFirstPerson) ? "kFirstPerson" :
-					playerCamera->QCameraEquals(RE::CameraState::kIronSights) ? "kIronSights" :
-					playerCamera->QCameraEquals(RE::CameraState::kPCTransition) ? "kPCTransition" :
-					playerCamera->QCameraEquals(RE::CameraState::kFree) ? "kFree" :
-					playerCamera->QCameraEquals(RE::CameraState::kAnimated) ? "kAnimated" :
-					"other");
+		const bool isKillCamActive =
+			playerCamera->QCameraEquals(RE::CameraState::kVATS) ||
+			playerCamera->QCameraEquals(RE::CameraState::kAnimated);
+		const bool isStableGameplayState =
+			playerCamera->QCameraEquals(RE::CameraState::k3rdPerson) ||
+			playerCamera->QCameraEquals(RE::CameraState::kFirstPerson) ||
+			playerCamera->QCameraEquals(RE::CameraState::kIronSights);
+
+		if (!isFurnitureNow && !isTransitionNow && !isKillCamActive && isStableGameplayState) {
+			if (m_PseudoReenableFrameCount > 0)
+				m_PseudoReenableFrameCount--;
+			if (m_PseudoReenableFrameCount <= 0) {
+				// Idempotent push. Only push k3rdPerson if it is not already on
+				// the camera's return stack - after a kill cam the engine may
+				// have already popped pseudo's k3rdPerson and restored the base
+				// state, so a blind PopState would pop the BASE state and
+				// corrupt the stack (player freezes). Never PopState here.
+				const bool isThirdPersonNow = playerCamera->QCameraEquals(RE::CameraState::k3rdPerson);
+				bool k3rdOnStack = false;
+				for (const auto& statePtr : playerCamera->tempReturnStates) {
+					if (statePtr && statePtr->id == RE::CameraState::k3rdPerson) {
+						k3rdOnStack = true;
+						break;
+					}
+				}
+				if (!isThirdPersonNow && !k3rdOnStack) {
+					playerCamera->PushState(RE::CameraState::k3rdPerson);
+					m_PseudoPushedK3rdPerson = true;
+					LOG_INFO("Pseudo-FPP: pending push k3rdPerson (post-menu recovery)");
+				} else {
+					// Already in k3rdPerson (player's own base state) or k3rdPerson
+					// already on the return stack - pseudo did NOT push it, so the
+					// menu handler must not pop it later.
+					m_PseudoPushedK3rdPerson = false;
+					LOG_INFO("Pseudo-FPP: pending push skipped (isTPP={}, k3rdOnStack={})", isThirdPersonNow, k3rdOnStack);
+				}
+				m_PseudoPendingK3rdPersonPush = false;
 			}
-			m_PseudoPushedK3rdPerson = true;
+		} else {
+			// still transitioning (VATS/kill cam) - keep waiting, reset the
+			// delay so we wait a full delay after the transition settles
+			m_PseudoReenableFrameCount = 30;
 		}
-		m_PseudoPendingK3rdPersonPush = false;
 	}
 
-	// --- ADS (Starfield-style) ---
-	static bool wasAiming = false;
-	static bool headHidden = false;
-	if (m_PseudoFPPActive && !IsBlockingMenuOpen()) {
-		auto* player = RE::PlayerCharacter::GetSingleton();
+		// --- ADS (Starfield-style) ---
+		static bool wasAiming = false;
+		static bool headHidden = false;
+		if (m_PseudoFPPActive && !IsBlockingMenuOpen() && !Patch::Hooks::IsVATSActive()) {
+			auto* player = RE::PlayerCharacter::GetSingleton();
 
-		// --- Hide the player's head while the rig pins the camera to it ---
-		RE::NiAVObject* headNode = nullptr;
-		if (player && player->currentProcess && player->currentProcess->middleHigh)
-			headNode = player->currentProcess->middleHigh->headNode;
-		if (headNode)
-			headNode->SetAppCulled(true);
-		headHidden = true;
+			// --- Hide the player's head while the rig pins the camera to it ---
+			RE::NiAVObject* headNode = nullptr;
+			if (player && player->currentProcess && player->currentProcess->middleHigh)
+				headNode = player->currentProcess->middleHigh->headNode;
+			if (headNode)
+				headNode->SetAppCulled(true);
+			headHidden = true;
 
-		const bool isFurnitureNow = playerCamera->QCameraEquals(RE::CameraState::kFurniture);
-		const bool isTransitionNow = playerCamera->QCameraEquals(RE::CameraState::kPCTransition);
+			const bool isFurnitureNow = playerCamera->QCameraEquals(RE::CameraState::kFurniture);
+			const bool isTransitionNow = playerCamera->QCameraEquals(RE::CameraState::kPCTransition);
 
-		if (!isFurnitureNow && !isTransitionNow) {
-			// Poll the physical aim button/trigger instead of relying on the
-			// engine's kIronSights camera state. Aiming while the game is in
-			// third person (which is what the pseudo camera is under the hood)
-			// does NOT change CameraState to kIronSights - the engine just
-			// zooms while staying in kThirdPerson. The physical-button check
-			// catches that, and real-FPP aiming (which DOES flip the state to
-			// kIronSights) is caught by isIronSightsNow. Mirrors ImprovedCameraSF.
-			const int adsKey = m_pluginConfig->PseudoFPP().iADSKey;
-			const bool isADSKeyDown = (GetAsyncKeyState(adsKey) & 0x8000) != 0;
-			const bool isGamepadAimingNow = IsGamepadAiming(m_pluginConfig->PseudoFPP().iGamepadTriggerThreshold);
+			if (!isFurnitureNow && !isTransitionNow) {
+				// Poll the physical aim button/trigger instead of relying on the
+				// engine's kIronSights camera state. Aiming while the game is in
+				// third person (which is what the pseudo camera is under the hood)
+				// does NOT change CameraState to kIronSights - the engine just
+				// zooms while staying in kThirdPerson. The physical-button check
+				// catches that, and real-FPP aiming (which DOES flip the state to
+				// kIronSights) is caught by isIronSightsNow. Mirrors ImprovedCameraSF.
+				const int adsKey = m_pluginConfig->PseudoFPP().iADSKey;
+				const bool isADSKeyDown = (GetAsyncKeyState(adsKey) & 0x8000) != 0;
+				const bool isGamepadAimingNow = IsGamepadAiming(m_pluginConfig->PseudoFPP().iGamepadTriggerThreshold);
 
-			const bool isTPP = playerCamera->QCameraEquals(RE::CameraState::k3rdPerson);
-			const bool isFPP = playerCamera->QCameraEquals(RE::CameraState::kFirstPerson);
-			const bool isIronSightsNow = playerCamera->QCameraEquals(RE::CameraState::kIronSights);
-			const bool isAimingNow = (isADSKeyDown || isGamepadAimingNow) && (isIronSightsNow || isTPP || isFPP);
+				const bool isTPP = playerCamera->QCameraEquals(RE::CameraState::k3rdPerson);
+				const bool isFPP = playerCamera->QCameraEquals(RE::CameraState::kFirstPerson);
+				const bool isIronSightsNow = playerCamera->QCameraEquals(RE::CameraState::kIronSights);
+				const bool isWeaponDrawn = player && Helper::IsWeaponDrawn(player);
+				const bool isAimingNow = (isADSKeyDown || isGamepadAimingNow) && (isIronSightsNow || isTPP || isFPP);
 
-			if (isAimingNow) {
-				if (!isFPP) {
-					playerCamera->SetState(playerCamera->GetState(RE::CameraState::kFirstPerson).get());
-					LOG_INFO("Pseudo-FPP: ADS -> FPP");
+				if (isAimingNow) {
+					if (!isFPP) {
+						playerCamera->SetState(playerCamera->GetState(RE::CameraState::kFirstPerson).get());
+						LOG_INFO("Pseudo-FPP: ADS -> FPP");
+					}
 				}
-			}
-			else if (wasAiming) {
-				if (isFPP) {
-					playerCamera->SetState(playerCamera->GetState(RE::CameraState::k3rdPerson).get());
-					LOG_INFO("Pseudo-FPP: ADS end -> TPP (restore pseudo)");
+				else {
+					// Not aiming: keep the pseudo rig active. If the
+					// engine dropped us into real FPP or iron sights
+					// (e.g. the weapon-drawn camera) while pseudo is
+					// enabled, return to the pseudo k3rdPerson so
+					// normal shooting stays on the pseudo camera.
+					if ((isFPP || isIronSightsNow) && isWeaponDrawn) {
+						RestorePseudoK3rdPerson();
+						LOG_INFO("Pseudo-FPP: weapon drawn -> TPP (restore pseudo, wasIronSights={})", isIronSightsNow);
+					}
+					else if (wasAiming && (isFPP || isIronSightsNow)) {
+						RestorePseudoK3rdPerson();
+						LOG_INFO("Pseudo-FPP: ADS end -> TPP (restore pseudo)");
+					}
 				}
+				wasAiming = isAimingNow;
 			}
-			wasAiming = isAimingNow;
-		}
 
 		// --- Body follows camera yaw ---
 		// When the camera turns more than ~90 deg away from the body's

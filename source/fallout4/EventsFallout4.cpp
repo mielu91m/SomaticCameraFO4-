@@ -19,37 +19,13 @@ namespace Events {
 		return &instance;
 	}
 
-void Observer::Register()
+	void Observer::Register()
 	{
 		auto ui = RE::UI::GetSingleton();
 		if (ui)
 			ui->RegisterSink<RE::MenuOpenCloseEvent>(this);
 
-		auto loadGameSource = RE::TESLoadGameEvent::GetEventSource();
-		if (loadGameSource)
-			loadGameSource->RegisterSink(this);
-
 		LOG_DEBUG("Registered event sinks.");
-	}
-
-	RE::BSEventNotifyControl Observer::ProcessEvent(const RE::TESLoadGameEvent& a_event, RE::BSTEventSource<RE::TESLoadGameEvent>*)
-	{
-		// Game loaded - reset camera state to avoid corrupted stack
-		LOG_INFO("Game loaded - resetting camera state");
-		ResetCameraState();
-		return RE::BSEventNotifyControl::kContinue;
-	}
-
-	void Observer::ResetCameraState()
-	{
-		auto plugin = DLLMain::Plugin::Get();
-		auto ic = plugin->Fallout4()->Camera();
-		if (ic) {
-			ic->SetPseudoFPPActive(false);
-			ic->m_PseudoPushedK3rdPerson = false;
-			ic->m_PseudoPendingK3rdPersonPush = false;
-			LOG_INFO("Camera state reset on load");
-		}
 	}
 
 	void Observer::CheckSPIM()
@@ -57,20 +33,23 @@ void Observer::Register()
 		LOG_DEBUG("Checking for ShowPlayerInMenus...");
 	}
 
-RE::BSEventNotifyControl Observer::ProcessEvent(const RE::MenuOpenCloseEvent& a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*)
+	RE::BSEventNotifyControl Observer::ProcessEvent(const RE::MenuOpenCloseEvent& a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*)
 	{
 		auto plugin = DLLMain::Plugin::Get();
 		auto ic = plugin->Fallout4()->Camera();
 		auto config = plugin->Config();
 
 		// --- Disable pseudo camera for any blocking menu so the engine
-		// can handle the menu camera normally (Pip-Boy, workshop, dialogue, etc.)
+		// can handle the menu camera normally (workshop, dialogue, etc.)
 		// Re-enable pseudo when the blocking menu closes.
-		// For Pip-Boy specifically, also manage the camera stack so the
-		// engine gets a clean kFirstPerson without pseudo's k3rdPerson on top.
+		// Pip-Boy is handled separately by the StartPipboyMode /
+		// StopPipboyMode hooks (see Hooks.cpp) which disable/enable pseudo
+		// at the correct time — BEFORE the engine sets up the Pip-Boy
+		// camera, not after (MenuOpenCloseEvent fires too late).
 		static bool pseudoWasActiveBeforeMenu = false;
+		const bool isPipboyMenu = a_event.menuName == "PipboyMenu";
 		const bool isBlockingMenu =
-			a_event.menuName == "PipboyMenu" ||
+			isPipboyMenu ||
 			a_event.menuName == "WorkshopMenu" ||
 			a_event.menuName == "DialogueMenu" ||
 			a_event.menuName == "ContainerMenu" ||
@@ -87,50 +66,37 @@ RE::BSEventNotifyControl Observer::ProcessEvent(const RE::MenuOpenCloseEvent& a_
 			a_event.menuName == "LoadingMenu" ||
 			a_event.menuName == "MainMenu";
 
-		const bool isVATS = a_event.menuName == "VATSMenu";
-
-		if (a_event.opening && isBlockingMenu && ic->IsPseudoFPPActive()) {
-			// VATS safety: if previous VATS cycle left flag stuck, clear it
-			if (isVATS && pseudoWasActiveBeforeMenu) {
-				LOG_WARN("Pseudo-FPP: VATS opened but flag was stuck - force reset");
-				pseudoWasActiveBeforeMenu = false;
-			}
+		if (a_event.opening && isBlockingMenu && !isPipboyMenu && ic->IsPseudoFPPActive()) {
 			pseudoWasActiveBeforeMenu = true;
+			ic->SetPseudoFPPActive(false);
 
-			if (isVATS) {
-				// VATS: do NOT pop k3rdPerson. The engine manages its own camera
-				// during VATS (pushes kVATS on top) and restores k3rdPerson on
-				// exit. Popping here unbalances the stack and the engine's kill
-				// camera may crash trying to restore the popped state.
-				const bool hadPushed = ic->m_PseudoPushedK3rdPerson;
-				ic->SetPseudoFPPActive(false);
-				ic->m_PseudoPushedK3rdPerson = hadPushed;
-				LOG_INFO("Pseudo-FPP: VATS opened - kept k3rdPerson on stack (no pop)");
+			if (a_event.menuName == "VATSMenu") {
+				// VATS: the engine pushes its own kVATS camera state on top of
+				// pseudo's k3rdPerson and restores it on exit. Do NOT pop
+				// k3rdPerson here - if the camera is already in kVATS the pop
+				// is skipped anyway, and popping during the VATS exit/kill-cam
+				// transition corrupts the state stack (player freezes).
+				LOG_INFO("Pseudo-FPP: VATS opened - k3rdPerson left on stack");
 			} else {
-				// Other blocking menus: disable pseudo, then pop pseudo's
-				// k3rdPerson if the camera is currently in it.
-				ic->SetPseudoFPPActive(false);
-				auto playerCamera = RE::PlayerCamera::GetSingleton();
-				if (playerCamera && playerCamera->QCameraEquals(RE::CameraState::k3rdPerson)) {
-					playerCamera->PopState();
-					LOG_INFO("Pseudo-FPP: popped k3rdPerson for menu {}", a_event.menuName);
-				}
+				// Other blocking menus (workshop, dialogue, etc.): just
+				// disable pseudo. These menus run after MenuOpenCloseEvent,
+				// but they don't have their own StartXxxMode() hook, so we
+				// handle them here. Do NOT pop any camera states — the
+				// engine manages its own camera stack for these menus.
+				LOG_INFO("Pseudo-FPP: disabled for blocking menu {} (no stack manipulation)",
+					a_event.menuName);
 			}
-			LOG_INFO("Pseudo-FPP: disabled for menu {}", a_event.menuName);
 		}
-		else if (!a_event.opening && isBlockingMenu && pseudoWasActiveBeforeMenu) {
+		else if (!a_event.opening && isBlockingMenu && !isPipboyMenu && pseudoWasActiveBeforeMenu) {
 			pseudoWasActiveBeforeMenu = false;
-
-			// Defer pseudo re-activation until the engine has fully finished
-			// the menu/kill-camera exit transition. Re-enabling immediately here
-			// lets the scene-graph hooks run while camera nodes are still being
-			// swapped, which crashes on VATS kill cam. PerFrameUpdate performs
-			// the actual re-activation once the delay has elapsed.
+			ic->SetPseudoFPPActive(true);
+			// Signal PerFrameUpdate to re-push k3rdPerson on the next
+			// safe frame, rather than pushing here during the VATS-exit
+			// transition which can corrupt the camera state stack.
 			ic->m_PseudoPendingK3rdPersonPush = true;
 			ic->m_PseudoPushedK3rdPerson = false;
-			Patch::Hooks::InvalidatePseudoCameraCache();
 			ic->m_PseudoReenableFrameCount = 30;  // ~0.5s at 60fps
-			LOG_INFO("Pseudo-FPP: menu {} closed - deferred re-activation", a_event.menuName);
+			LOG_INFO("Pseudo-FPP: re-enabled after menu {} (deferred re-activation)", a_event.menuName);
 		}
 
 		if (a_event.menuName == "Console")

@@ -7,6 +7,10 @@
 
 #include "cameras/ICamera.h"
 
+namespace Patch {
+	class Hooks;
+}
+
 namespace Events {
 	class Observer;
 }
@@ -35,6 +39,8 @@ namespace ImprovedCamera {
 		bool IsFirstPerson() const { return m_IsFirstPerson; }
 		bool IsPseudoFPPActive() const { return m_PseudoFPPActive; }
 		void SetPseudoFPPActive(bool a_active);
+		void PopPseudoK3rdPerson();
+		void RestorePseudoK3rdPerson();
 		float UpdateNearDistance(float fNear);
 
 		void RequestAPIs();
@@ -102,8 +108,10 @@ namespace ImprovedCamera {
 		bool m_PseudoPushedK3rdPerson = false;
 		bool m_PseudoPendingK3rdPersonPush = false;
 		int m_PseudoReenableFrameCount = 0;
+		bool m_PseudoActiveBeforePipboy = false;
 
 		friend class Events::Observer;
+		friend class ::Patch::Hooks;
 	};
 
 }

@@ -25,16 +25,17 @@ namespace Patch {
 		void Install();
 		void Input();
 		void Setup();
-		void HookUpdateThirdPerson();
 		void HookNiCameraUpdateWorldData();
 		void HookPlayerCameraUpdate();
 		void HookThirdPersonStateUpdate();
+		void HookPipboyMode();
 		void InstallSceneGraphHooks();
 
-		static void Hook_UpdateThirdPerson(RE::PlayerCamera* camera, bool weaponDrawn);
 		static void Hook_NiCamera_UpdateWorldData(RE::NiCamera* a_this, RE::NiUpdateData* a_data);
 		static void Hook_PlayerCameraUpdate(RE::PlayerCamera* a_this);
 		static void Hook_ThirdPersonStateUpdate(RE::ThirdPersonState* a_this, RE::BSTSmartPointer<RE::TESCameraState>& a_nextState);
+		static void Hook_StartPipboyMode(RE::PlayerCamera* a_this, bool a_forcePipboyModeCamera);
+		static void Hook_StopPipboyMode(RE::PlayerCamera* a_this);
 
 	private:
 		friend class Fallout4;

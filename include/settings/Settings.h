@@ -141,7 +141,7 @@ namespace Settings {
 	};
 
 	struct PseudoFPP {
-		float fHeightOffset = 0.0f;
+		float fHeightOffset = -5.0f;
 		float fForwardOffset = 0.0f;
 		std::int32_t iToggleKey = 115;
 		std::int32_t iADSKey = 2;
