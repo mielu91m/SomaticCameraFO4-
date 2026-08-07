@@ -39,6 +39,9 @@ namespace ImprovedCamera {
 		bool IsFirstPerson() const { return m_IsFirstPerson; }
 		bool IsPseudoFPPActive() const { return m_PseudoFPPActive; }
 		void SetPseudoFPPActive(bool a_active);
+		bool IsPseudoMenuStandDown() const { return m_PseudoMenuBlockFrames > 0; }
+		bool IsTerminalMenuOpen() const { return m_TerminalMenuIsOpen; }
+		bool IsPlayerInFurniture() const;
 		void PopPseudoK3rdPerson();
 		void RestorePseudoK3rdPerson();
 		float UpdateNearDistance(float fNear);
@@ -109,6 +112,28 @@ namespace ImprovedCamera {
 		bool m_PseudoPendingK3rdPersonPush = false;
 		int m_PseudoReenableFrameCount = 0;
 		bool m_PseudoActiveBeforePipboy = false;
+		// True while a TerminalMenu session is active (from when the menu
+		// opens until it fully closes). While set, pseudo stays disabled and
+		// the furniture-exit re-enable in PerFrameUpdate is deferred, so
+		// pseudo cannot capture the terminal camera/animations mid-session.
+		bool m_TerminalMenuIsOpen = false;
+		// Set true when pseudo detected a furniture/transition exit (camera in
+		// kFurniture/kPCTransition, transitioning to k3rdPerson/kFirstPerson).
+		// PerFrameUpdate re-enables pseudo when the furniture state is gone.
+		bool m_PseudoPendingFurnitureExit = false;
+		// Grace frames counted down ONLY after the player has fully left the
+		// furniture object (terminal get-up / chair stand-up animation). While
+		// the player still occupies furniture (camera in kFurniture/kPCTransition
+		// OR currentFurniture/occupiedFurniture handle alive) it is re-armed to
+		// a fixed value so pseudo cannot re-engage mid-exit; once the player is
+		// fully out it counts down and pseudo is re-enabled at 0.
+		int m_PseudoFurnitureExitGraceFrames = 0;
+		// Hard stand-down counter: while > 0 every pseudo hook behaves as if a
+		// blocking menu is open, so the engine can freely run the menu camera
+		// (Pip-Boy / terminal transition to kFirstPerson, etc.). Set on menu
+		// open AND close (grace period so the engine's menu camera restore
+		// settles), counted down once per frame in PerFrameUpdate.
+		int m_PseudoMenuBlockFrames = 0;
 
 		friend class Events::Observer;
 		friend class ::Patch::Hooks;

@@ -66,7 +66,37 @@ namespace Events {
 			a_event.menuName == "LoadingMenu" ||
 			a_event.menuName == "MainMenu";
 
-		if (a_event.opening && isBlockingMenu && !isPipboyMenu && ic->IsPseudoFPPActive()) {
+		// Hard stand-down for EVERY blocking menu (including Pip-Boy): from
+		// the moment a blocking menu opens pseudo must not fight the engine's
+		// menu camera, even on the very first frame when the menu may not be
+		// registered as open yet. The counter is counted down in
+		// PerFrameUpdate; while > 0 every pseudo hook stands down.
+		if (a_event.opening && isBlockingMenu && ic) {
+			ic->m_PseudoMenuBlockFrames = 30;
+		}
+
+		// TerminalMenu is special: the player enters a terminal through
+		// furniture, so pseudo has ALREADY been disabled by the
+		// StartFurnitureMode hook before this event fires. It must stay
+		// disabled for the WHOLE terminal session (menu + the camera
+		// transitions into and out of the terminal's first-person view) and
+		// be re-enabled only after the terminal has fully closed and the
+		// player is back in a gameplay state. This branch is deliberately
+		// NOT gated on IsPseudoFPPActive() — the old code gated it there and,
+		// because pseudo was already off, the flag was never set, which let
+		// PerFrameUpdate re-enable pseudo mid-terminal and soft-lock the
+		// player (terminal window/animations captured, can't use or exit).
+		if (a_event.opening && isBlockingMenu && a_event.menuName == "TerminalMenu" && ic) {
+			ic->m_TerminalMenuIsOpen = true;
+			if (ic->IsPseudoFPPActive()) {
+				// If pseudo somehow got re-enabled before the menu registered,
+				// force it off and mark it for re-enable after the session.
+				ic->m_PseudoPendingFurnitureExit = true;
+				ic->SetPseudoFPPActive(false);
+			}
+			LOG_INFO("Pseudo-FPP: TerminalMenu opening — terminal session active, pseudo disabled");
+		}
+		else if (a_event.opening && isBlockingMenu && !isPipboyMenu && ic->IsPseudoFPPActive()) {
 			pseudoWasActiveBeforeMenu = true;
 			ic->SetPseudoFPPActive(false);
 
@@ -87,7 +117,18 @@ namespace Events {
 					a_event.menuName);
 			}
 		}
+		else if (!a_event.opening && isBlockingMenu && a_event.menuName == "TerminalMenu" && ic) {
+			// Terminal session is over. Keep pseudo disabled until the engine
+			// has fully exited the terminal (stand-up animation / camera
+			// restore) — PerFrameUpdate re-enables it once the camera is back
+			// in a gameplay state. The longer grace period covers the exit
+			// animation so pseudo doesn't fight it.
+			ic->m_TerminalMenuIsOpen = false;
+			ic->m_PseudoMenuBlockFrames = 60;
+			LOG_INFO("Pseudo-FPP: TerminalMenu closed — pseudo stays disabled until furniture exit");
+		}
 		else if (!a_event.opening && isBlockingMenu && !isPipboyMenu && pseudoWasActiveBeforeMenu) {
+			// Other blocking menus: re-enable pseudo
 			pseudoWasActiveBeforeMenu = false;
 			ic->SetPseudoFPPActive(true);
 			// Signal PerFrameUpdate to re-push k3rdPerson on the next
@@ -96,7 +137,17 @@ namespace Events {
 			ic->m_PseudoPendingK3rdPersonPush = true;
 			ic->m_PseudoPushedK3rdPerson = false;
 			ic->m_PseudoReenableFrameCount = 30;  // ~0.5s at 60fps
+			// Fresh grace period after the menu closes so the engine's
+			// camera restore settles before pseudo starts pinning the camera again.
+			ic->m_PseudoMenuBlockFrames = 30;
 			LOG_INFO("Pseudo-FPP: re-enabled after menu {} (deferred re-activation)", a_event.menuName);
+		}
+		else if (!a_event.opening && isBlockingMenu && ic && ic->m_PseudoMenuBlockFrames > 0) {
+			// Blocking menu closed but pseudo was not re-enabled here
+			// (e.g. Pip-Boy, which is re-enabled by the StopPipboyMode hook).
+			// Refresh the stand-down grace period anyway so the engine's
+			// menu-camera restore settles before any pseudo hook runs again.
+			ic->m_PseudoMenuBlockFrames = 30;
 		}
 
 		if (a_event.menuName == "Console")

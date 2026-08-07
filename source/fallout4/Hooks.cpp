@@ -44,6 +44,12 @@ namespace Address::Hook
 
 	using StopPipboyModeFunc = void(__thiscall*)(RE::PlayerCamera*);
 	inline StopPipboyModeFunc StopPipboyMode_Original = nullptr;
+
+	using StartFurnitureModeFunc = void(__thiscall*)(RE::PlayerCamera*, RE::TESObjectREFR*);
+	inline StartFurnitureModeFunc StartFurnitureMode_Original = nullptr;
+
+	using SetStateFunc = RE::TESCameraState*(__thiscall*)(RE::PlayerCamera*, RE::TESCameraState*);
+	inline SetStateFunc SetState_Original = nullptr;
 }
 
 namespace Patch {
@@ -83,6 +89,7 @@ namespace Patch {
 		}
 
 		bool IsBlockingMenuOpen();
+		bool IsMenuStandDown();
 
 		// True while the engine's VATS playback / kill cam is running. The
 		// scene-graph hooks must stand down during it - the cinematic moves the
@@ -164,20 +171,35 @@ namespace Patch {
 			if (!IsActive())
 				return;
 
-			if (IsBlockingMenuOpen() || IsVATSKillCamActiveDiag())
+			if (IsMenuStandDown() || IsVATSKillCamActiveDiag())
+				return;
+
+			// Additional check: if terminal menu is open, block camera pinning
+			// even if the camera state is still k3rdPerson. This prevents pseudo
+			// from interfering with terminal camera control while keeping pseudo
+			// logically active.
+			auto ic = GetIC();
+			if (ic && ic->IsTerminalMenuOpen())
 				return;
 
 			auto* camera = RE::PlayerCamera::GetSingleton();
 			if (!camera)
 				return;
 
-			// pseudo overrides third-person-style camera states
-			// (k3rdPerson, kIronSights) plus furniture and power armor
-			// transition (kFurniture, kPCTransition)
+			// Additional safeguard: if camera is in kFurniture or kPCTransition state,
+			// block pinning regardless of menu state. This covers the transition
+			// window before the menu registers as open.
+			if (camera->QCameraEquals(RE::CameraState::kFurniture) ||
+				camera->QCameraEquals(RE::CameraState::kPCTransition))
+				return;
+
+			// pseudo overrides third-person-style camera states only.
+			// kFurniture / kPCTransition (terminals, chairs, power-armor and
+			// POV transitions) are excluded here — they are covered by
+			// IsMenuStandDown() above, which stands the whole rig down while
+			// the engine needs the camera for its own animation.
 			if (!camera->QCameraEquals(RE::CameraState::k3rdPerson) &&
-				!camera->QCameraEquals(RE::CameraState::kIronSights) &&
-				!camera->QCameraEquals(RE::CameraState::kFurniture) &&
-				!camera->QCameraEquals(RE::CameraState::kPCTransition))
+				!camera->QCameraEquals(RE::CameraState::kIronSights))
 				return;
 
 			auto* tesCam = static_cast<RE::TESCamera*>(camera);
@@ -263,6 +285,43 @@ namespace Patch {
 			return false;
 		}
 
+		// True whenever pseudo must completely stand down so the engine keeps
+		// full camera control: a blocking menu is open, the Pip-Boy camera is
+		// active, the camera is in a furniture / transition state (terminals
+		// in FO4 are furniture — pinning the camera while the engine plays the
+		// terminal's sit animation stalls the activation and the TerminalMenu
+		// never opens, soft-locking the player), or the hard stand-down counter
+		// is still running (covers the transition window BEFORE the menu
+		// registers as open and the grace period after it closes). While this
+		// is true pseudo must NOT block the engine's camera-state transitions
+		// (e.g. the k3rdPerson -> kFirstPerson transition the Pip-Boy/terminal
+		// view needs) nor re-pin the camera to the head.
+		bool IsMenuStandDown()
+		{
+			auto ic = GetIC();
+			if (ic && ic->IsPseudoMenuStandDown())
+				return true;
+			auto* camera = RE::PlayerCamera::GetSingleton();
+			if (camera && camera->pipboyMode)
+				return true;
+			if (camera &&
+				(camera->QCameraEquals(RE::CameraState::kFurniture) ||
+				 camera->QCameraEquals(RE::CameraState::kPCTransition)))
+				return true;
+			// Furniture/terminal hold-down: terminals (and chairs) are furniture.
+			// The camera can briefly leave kFurniture/kPCTransition for the
+			// terminal's first-person view while the player is still occupying
+			// the furniture object, so also stand the whole rig down based on the
+			// furniture handle. This also covers the activation frame race: if
+			// ForceCameraToHead runs on the same frame the player enters furniture
+			// (before StartFurnitureMode/SetState could disable pseudo), standing
+			// down on the furniture handle keeps pseudo from capturing the
+			// terminal entry animation and prevents the menu from ever opening.
+			if (camera && ic && ic->IsPlayerInFurniture())
+				return true;
+			return IsBlockingMenuOpen();
+		}
+
 		bool IsVATSKillCamActive()
 		{
 			// Stand down while VATS playback runs (shot playback and the death
@@ -327,7 +386,15 @@ namespace Patch {
 
 		static void RestorePseudoRig(RE::NiAVObject* a_this)
 		{
-			if (!IsActive() || IsBlockingMenuOpen() || IsVATSKillCamActiveDiag())
+			if (!IsActive() || IsMenuStandDown() || IsVATSKillCamActiveDiag())
+				return;
+
+			// Additional check: if terminal menu is open, block rig restoration
+			// even if the camera state is still k3rdPerson. This prevents pseudo
+			// from interfering with terminal camera control while keeping pseudo
+			// logically active.
+			auto ic = GetIC();
+			if (ic && ic->IsTerminalMenuOpen())
 				return;
 
 			// fast path: cache populated - resolve by pointer comparison only.
@@ -501,6 +568,8 @@ namespace Patch {
 		HookNiCameraUpdateWorldData();
 		HookThirdPersonStateUpdate();
 		HookPipboyMode();
+		HookFurnitureMode();
+		HookCameraStateSet();
 		PseudoFPP::InstallSceneGraphHooks();
 
 		// Register the MenuOpenCloseEvent handler so pseudo is disabled for
@@ -545,7 +614,18 @@ namespace Patch {
 		// pseudo head position so the engine's own TPP math can't win
 		Address::Hook::PlayerCameraUpdate_Original(a_this);
 
-		if (!pseudoActive || PseudoFPP::IsBlockingMenuOpen() || PseudoFPP::IsVATSKillCamActiveDiag())
+		// Re-check pseudo active state after the engine's update, as it may have
+		// been disabled by PerFrameUpdate during the update (e.g., when entering
+		// furniture/terminal state). Also check camera state directly to prevent
+		// ForceCameraToHead from running while in kFurniture/kPCTransition.
+		if (!pseudoActive || PseudoFPP::IsMenuStandDown() || PseudoFPP::IsVATSKillCamActiveDiag())
+			return;
+
+		// Additional safeguard: if camera is in kFurniture or kPCTransition state,
+		// block ForceCameraToHead regardless of pseudo active state. This prevents
+		// pseudo from interfering with terminal interactions.
+		if (a_this->QCameraEquals(RE::CameraState::kFurniture) ||
+			a_this->QCameraEquals(RE::CameraState::kPCTransition))
 			return;
 
 		auto* tesCam = static_cast<RE::TESCamera*>(a_this);
@@ -577,28 +657,32 @@ namespace Patch {
 
 	void Hooks::Hook_ThirdPersonStateUpdate(RE::ThirdPersonState* a_this, RE::BSTSmartPointer<RE::TESCameraState>& a_nextState)
 	{
-		// BEFORE calling the original: if Pip-Boy is active, prevent the
-		// engine from transitioning away from the Pip-Boy camera state.
-		// When a weapon is drawn the engine's ThirdPersonState::Update
-		// unconditionally sets a_nextState to kFirstPerson, which would
-		// overwrite the Pip-Boy camera every frame ("constantly overwritten").
-		// Clear a_nextState so the camera stays in its current (Pip-Boy) state.
-		auto* camera = RE::PlayerCamera::GetSingleton();
-		if (camera && camera->pipboyMode) {
-			a_nextState = nullptr;
-			return;
-		}
-
+		// Run the engine's update first.
 		Address::Hook::ThirdPersonStateUpdate_Original(a_this, a_nextState);
 
 		auto ic = GetIC();
-		if (!ic || !ic->IsPseudoFPPActive() || PseudoFPP::IsBlockingMenuOpen() || PseudoFPP::IsVATSKillCamActiveDiag())
+
+		const bool pseudoBlocking =
+			ic && ic->IsPseudoFPPActive() &&
+			!PseudoFPP::IsMenuStandDown() &&
+			!PseudoFPP::IsVATSKillCamActiveDiag();
+
+		if (!pseudoBlocking)
 			return;
 
-		if (a_nextState && (a_nextState->id == RE::CameraState::kFirstPerson || a_nextState->id == RE::CameraState::kVATS))
+		if (a_nextState && (a_nextState->id == RE::CameraState::kFirstPerson ||
+							a_nextState->id == RE::CameraState::kVATS))
 			return;
 
-		PseudoFPP::ForceCameraToHead();
+		// Additional safeguard: if camera is in kFurniture or kPCTransition state,
+		// block ForceCameraToHead regardless of pseudo active state. This prevents
+		// pseudo from interfering with terminal interactions.
+		auto* camera = RE::PlayerCamera::GetSingleton();
+		if (camera && (camera->QCameraEquals(RE::CameraState::kFurniture) ||
+		               camera->QCameraEquals(RE::CameraState::kPCTransition)))
+			return;
+
+   		PseudoFPP::ForceCameraToHead();
 	}
 
 	void Hooks::HookPipboyMode()
@@ -651,6 +735,14 @@ namespace Patch {
 			ic->m_PseudoActiveBeforePipboy = false;
 		}
 
+		// Hard stand-down: from the moment the Pip-Boy camera setup begins
+		// pseudo must not touch the camera state machine at all, or it fights
+		// the engine's transition into the first-person Pip-Boy view. The
+		// counter also covers the pre-menu frame where pipboyMode may not be
+		// set yet and the PipboyMenu may not be registered open.
+		if (ic)
+			ic->m_PseudoMenuBlockFrames = 30;
+
 		// If a weapon is drawn, the camera is currently in k3rdPerson
 		// (pseudo's state). The engine's StartPipboyMode expects to
 		// transition from kFirstPerson (weapon-drawn first-person) to
@@ -685,8 +777,125 @@ namespace Patch {
 			ic->m_PseudoPushedK3rdPerson = false;
 			ic->m_PseudoReenableFrameCount = 30;  // ~0.5s at 60fps
 		}
-		if (ic)
+		if (ic) {
+			// Fresh grace period after the Pip-Boy closes so the engine's
+			// camera restore (return-stack pop, sheathe transition) settles
+			// before pseudo starts pinning the camera again.
+			ic->m_PseudoMenuBlockFrames = 30;
 			ic->m_PseudoActiveBeforePipboy = false;
+		}
+	}
+
+	void Hooks::HookFurnitureMode()
+	{
+		void* addr = reinterpret_cast<void*>(REL::ID(RE::ID::PlayerCamera::StartFurnitureMode).address());
+		if (!addr) {
+			LOG_WARN("StartFurnitureMode hook: failed to resolve address");
+			return;
+		}
+		if (MH_CreateHook(addr, reinterpret_cast<void*>(&Hook_StartFurnitureMode),
+			reinterpret_cast<void**>(&Address::Hook::StartFurnitureMode_Original)) != MH_OK) {
+			LOG_WARN("StartFurnitureMode hook: failed to create hook");
+			return;
+		}
+		MH_EnableHook(addr);
+		LOG_INFO("StartFurnitureMode hook installed successfully");
+	}
+
+	void Hooks::Hook_StartFurnitureMode(RE::PlayerCamera* a_this, RE::TESObjectREFR* a_furniture)
+	{
+		// Disable pseudo BEFORE the engine transitions to kFurniture, so
+		// that no pseudo hook (ForceCameraToHead in PlayerCameraUpdate or
+		// ThirdPersonState, scene-graph RestorePseudoRig, etc.) interferes
+		// with the engine's furniture camera setup. This is the root cause
+		// of terminals not opening: ForceCameraToHead pins the camera to
+		// the head on the same frame the engine calls StartFurnitureMode,
+		// racing/corrupting the state transition before the TerminalMenu
+		// can register itself.
+		// Also pop k3rdPerson if pseudo pushed it to allow the engine to
+		// transition to the correct furniture state.
+		auto ic = GetIC();
+		const bool pseudoWasActive = ic && ic->IsPseudoFPPActive();
+		if (pseudoWasActive) {
+			LOG_INFO("Pseudo-FPP: StartFurnitureMode -> disabling pseudo");
+			ic->SetPseudoFPPActive(false);
+			ic->m_PseudoPendingFurnitureExit = true;
+
+			// Pop k3rdPerson from the camera stack if pseudo pushed it
+			if (ic->m_PseudoPushedK3rdPerson) {
+				ic->PopPseudoK3rdPerson();
+				ic->m_PseudoPushedK3rdPerson = false;
+				LOG_INFO("Pseudo-FPP: popped k3rdPerson for furniture mode");
+			}
+		}
+		if (ic)
+			ic->m_PseudoMenuBlockFrames = 120;
+
+		Address::Hook::StartFurnitureMode_Original(a_this, a_furniture);
+	}
+
+	void Hooks::HookCameraStateSet()
+	{
+		// Hook PlayerCamera::SetState on the vtable (slot 0x04 is confirmed working).
+		// This catches kFurniture/kPCTransition transitions when the engine changes state.
+		// We disable pseudo BEFORE the engine's state transition takes effect so that no
+		// pseudo hook (ForceCameraToHead, scene-graph RestorePseudoRig) interferes with
+		// the furniture camera setup or terminal menu activation.
+		REL::Relocation<std::uintptr_t> vtable{ RE::VTABLE::PlayerCamera[0] };
+		if (!vtable) {
+			LOG_WARN("SetState hook: failed to resolve PlayerCamera vtable");
+			return;
+		}
+
+		const std::size_t setStateSlot = 0x04;
+		auto original = vtable.write_vfunc(setStateSlot, reinterpret_cast<std::uintptr_t>(Hook_PlayerCameraSetState));
+		if (!original) {
+			LOG_WARN("SetState hook: write_vfunc failed for slot 0x{:X}", setStateSlot);
+			return;
+		}
+		Address::Hook::SetState_Original = reinterpret_cast<Address::Hook::SetStateFunc>(original);
+		LOG_INFO("SetState hook installed successfully (vtable slot 0x{:X}, orig={:p})", setStateSlot, reinterpret_cast<void*>(original));
+	}
+
+	RE::TESCameraState* Hooks::Hook_PlayerCameraSetState(RE::PlayerCamera* a_this, RE::TESCameraState* a_newstate)
+	{
+		auto ic = GetIC();
+
+		// DEBUG: log every state change through this hook
+		if (a_newstate) {
+			LOG_INFO("[DEBUG] SetState hook called: newstate.id={}, pseudoActive={}",
+				a_newstate->id.underlying(),
+				ic && ic->IsPseudoFPPActive() ? 1 : 0);
+		}
+
+		// SetState is the lowest-level camera state change in PlayerCamera.
+		// The engine calls it when entering furniture (terminals/chairs) and
+		// when returning to gameplay. Disable pseudo BEFORE the engine
+		// actually switches to ANY state other than k3rdPerson/kFirstPerson/kIronSights
+		// so that no pseudo hook (ForceCameraToHead, scene-graph RestorePseudoRig) can
+		// interfere with the state transition or terminal menu activation.
+		// This covers terminals, VATS, kill cams, and any other special camera states.
+		// Also pop k3rdPerson if pseudo pushed it to allow the engine to
+		// transition to the correct state.
+		if (ic && ic->IsPseudoFPPActive() && a_newstate &&
+			(a_newstate->id != RE::CameraState::k3rdPerson &&
+			 a_newstate->id != RE::CameraState::kFirstPerson &&
+			 a_newstate->id != RE::CameraState::kIronSights)) {
+			LOG_INFO("Pseudo-FPP: SetState -> disabling pseudo (entering non-gameplay state, state={})",
+				a_newstate->id.underlying());
+			ic->SetPseudoFPPActive(false);
+			ic->m_PseudoPendingFurnitureExit = true;
+			ic->m_PseudoMenuBlockFrames = 120;
+
+			// Pop k3rdPerson from the camera stack if pseudo pushed it
+			if (ic->m_PseudoPushedK3rdPerson) {
+				ic->PopPseudoK3rdPerson();
+				ic->m_PseudoPushedK3rdPerson = false;
+				LOG_INFO("Pseudo-FPP: popped k3rdPerson for non-gameplay state");
+			}
+		}
+
+		return Address::Hook::SetState_Original(a_this, a_newstate);
 	}
 
 	void Hooks::HookNiCameraUpdateWorldData()

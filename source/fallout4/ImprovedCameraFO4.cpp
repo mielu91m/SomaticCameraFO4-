@@ -83,6 +83,26 @@ namespace ImprovedCamera {
 		}
 	}
 
+	bool ImprovedCameraFO4::IsPlayerInFurniture() const
+	{
+		auto player = RE::PlayerCharacter::GetSingleton();
+		if (!player || !player->currentProcess || !player->currentProcess->middleHigh)
+			return false;
+
+		// True as long as the player is occupying ANY furniture object, even
+		// while the camera has already left kFurniture for the terminal's
+		// first-person view or is playing the stand-up exit animation.
+		// currentFurniture is the furniture the actor is moving to/using,
+		// occupiedFurniture is the one they are physically sitting on.
+		auto& currentFurniture = player->currentProcess->middleHigh->currentFurniture;
+		if (currentFurniture && currentFurniture.get())
+			return true;
+		auto& occupiedFurniture = player->currentProcess->middleHigh->occupiedFurniture;
+		if (occupiedFurniture && occupiedFurniture.get())
+			return true;
+		return false;
+	}
+
 	void ImprovedCameraFO4::PopPseudoK3rdPerson()
 	{
 		auto playerCamera = RE::PlayerCamera::GetSingleton();
@@ -749,28 +769,110 @@ namespace ImprovedCamera {
 			m_pluginConfig->ReloadMCMKeybinds();
 		}
 
+		// Refresh menu stand-down counter once per frame.
+		// While > 0 every pseudo hook behaves as if a blocking menu is open,
+		// so the engine can freely run the menu camera (Pip-Boy / terminal
+		// transition to kFirstPerson, etc.).
+		if (m_PseudoMenuBlockFrames > 0)
+			m_PseudoMenuBlockFrames--;
+
+		// Fail-safe furniture/terminal detection (ordering- and hook-failure
+		// agnostic). The StartFurnitureMode/SetState hooks below should already
+		// disable pseudo on furniture entry, but if they fail to install (game
+		// version mismatch → unresolved REL::ID) or PlayerCamera::Update pins the
+		// camera on the same frame the player activates a terminal, pseudo can
+		// still be active here. Force it off the instant we detect the player is
+		// occupying any furniture object (currentFurniture/occupiedFurniture),
+		// which is set the moment the sit animation begins — this is the robust
+		// signal that pseudo must step aside so the engine can run the terminal
+		// entry/exit animation and the TerminalMenu can open. Re-enable happens
+		// in the furniture-exit block below once the player fully leaves.
+		if (m_PseudoFPPActive && !IsBlockingMenuOpen() && IsPlayerInFurniture()) {
+			LOG_INFO("Pseudo-FPP: furniture/terminal detected (IsPlayerInFurniture) — disabling pseudo (fail-safe)");
+			m_PseudoPendingFurnitureExit = true;
+			m_PseudoMenuBlockFrames = 120;
+			// Pop pseudo's pushed k3rdPerson so the engine owns the camera state
+			// stack while entering furniture (matches StartFurnitureMode hook).
+			if (m_PseudoPushedK3rdPerson) {
+				PopPseudoK3rdPerson();
+				m_PseudoPushedK3rdPerson = false;
+			}
+			SetPseudoFPPActive(false);
+		}
+
+		// Re-enable pseudo after a furniture / terminal session ends. pseudo
+		// was disabled by the SetState/StartFurnitureMode hooks when the player
+		// entered furniture (terminals, chairs). It must stay disabled through
+		// the WHOLE session: while a TerminalMenu is open the camera leaves
+		// kFurniture for the terminal's first-person view, so gating on
+		// !m_TerminalMenuIsOpen prevents pseudo from re-engaging mid-terminal
+		// (which captures the terminal window/animations and soft-locks the
+		// player — can't use or exit the terminal). The m_PseudoMenuBlockFrames
+		// gate additionally keeps pseudo off during the stand-down window set
+		// on entry (StartFurnitureMode) and on TerminalMenu close, so it cannot
+		// re-engage while the engine is still running the terminal entry/exit
+		// camera transition. Once the terminal has fully closed AND the camera
+		// is out of kFurniture/kPCTransition AND the stand-down has elapsed,
+		// re-enable.
+		if (!m_PseudoFPPActive && m_PseudoPendingFurnitureExit && !m_TerminalMenuIsOpen &&
+			m_PseudoMenuBlockFrames <= 0) {
+			const bool stillInFurniture =
+				playerCamera->QCameraEquals(RE::CameraState::kFurniture) ||
+				playerCamera->QCameraEquals(RE::CameraState::kPCTransition);
+			// Also keep pseudo off while the player still occupies the
+			// furniture object itself (IsPlayerInFurniture). This covers the
+			// races a pure camera-state check misses: on ENTER the camera may
+			// briefly be kFirstPerson before TerminalMenu registers while the
+			// furniture handle is already alive, and on EXIT the camera
+			// restores to gameplay BEFORE the stand-up animation finishes.
+			// When the player is fully out, count down a short grace window
+			// instead of re-engaging on the very next frame.
+			const bool stillInFurnitureObj = IsPlayerInFurniture();
+			if (stillInFurniture || stillInFurnitureObj) {
+				// Keep the exit grace armed so the engine's exit animation
+				// gets room to finish once the player actually leaves.
+				m_PseudoFurnitureExitGraceFrames = 90;
+			}
+			else {
+				// Fully out of furniture — count down the grace, then re-enable.
+				if (m_PseudoFurnitureExitGraceFrames > 0)
+					m_PseudoFurnitureExitGraceFrames--;
+				if (m_PseudoFurnitureExitGraceFrames <= 0) {
+					LOG_INFO("Pseudo-FPP: re-enabling after furniture exit");
+					m_PseudoPendingFurnitureExit = false;
+					m_PseudoFPPActive = true;
+					m_PseudoPendingK3rdPersonPush = true;
+					m_PseudoPushedK3rdPerson = false;
+					m_PseudoReenableFrameCount = 30;
+					// Don't shorten a longer stand-down (e.g. the 60-frame grace
+					// set when TerminalMenu closed) below the default 30 frames.
+					if (m_PseudoMenuBlockFrames < 30)
+						m_PseudoMenuBlockFrames = 30;
+				}
+			}
+		}
 
 		// toggle key (default VK_F4 = 115), read from config; the F4MCM hotkey
 		// control (Keybinds.json) takes precedence over the iToggleKey setting.
 		const int toggleKey = m_pluginConfig->ToggleKey();
 		bool currentKeyState = (GetAsyncKeyState(toggleKey) & 0x8000) != 0;
 		static bool lastKeyState = false;
-		if (currentKeyState && !lastKeyState && !IsBlockingMenuOpen()) {
+		if (currentKeyState && !lastKeyState && !IsBlockingMenuOpen() && !m_TerminalMenuIsOpen) {
 			m_PseudoFPPActive = !m_PseudoFPPActive;
 			LOG_INFO("Pseudo-FPP {} (key {} toggle)", m_PseudoFPPActive ? "enabled" : "disabled", toggleKey);
 
 			if (m_PseudoFPPActive) {
-				const bool isFurnitureNow = playerCamera->QCameraEquals(RE::CameraState::kFurniture);
-				const bool isTransitionNow = playerCamera->QCameraEquals(RE::CameraState::kPCTransition);
+				const bool isFurnitureToggle = playerCamera->QCameraEquals(RE::CameraState::kFurniture);
+				const bool isTransitionToggle = playerCamera->QCameraEquals(RE::CameraState::kPCTransition);
 				const bool isThirdPersonNow = playerCamera->QCameraEquals(RE::CameraState::k3rdPerson);
-				if (!isFurnitureNow && !isTransitionNow && !isThirdPersonNow) {
+				if (!isFurnitureToggle && !isTransitionToggle && !isThirdPersonNow) {
 					playerCamera->PushState(RE::CameraState::k3rdPerson);
 					m_PseudoPushedK3rdPerson = true;
 					LOG_INFO("Pseudo-FPP: forced third-person camera state");
 				}
 				else {
 					m_PseudoPushedK3rdPerson = false;
-					LOG_INFO("Pseudo-FPP: enabled in {} camera state", isFurnitureNow ? "furniture" : isTransitionNow ? "transition" : "third-person");
+					LOG_INFO("Pseudo-FPP: enabled in {} camera state", isFurnitureToggle ? "furniture" : isTransitionToggle ? "transition" : "third-person");
 				}
 			}
 			else {
@@ -796,10 +898,12 @@ namespace ImprovedCamera {
 	// pseudo after VATS closes, but defers the actual PushState to here
 	// so we push at a safe point (after the engine's VATS-exit
 	// transition has stabilized) rather than mid-transition.
-	if (m_PseudoFPPActive && m_PseudoPendingK3rdPersonPush &&
-		!IsBlockingMenuOpen() && !Patch::Hooks::IsVATSActive()) {
-		const bool isFurnitureNow = playerCamera->QCameraEquals(RE::CameraState::kFurniture);
-		const bool isTransitionNow = playerCamera->QCameraEquals(RE::CameraState::kPCTransition);
+	// Block pushing if terminal menu is open to avoid interfering with
+	// terminal camera control.
+	if (m_PseudoFPPActive && m_PseudoPendingK3rdPersonPush && m_PseudoMenuBlockFrames <= 0 &&
+		!IsBlockingMenuOpen() && !m_TerminalMenuIsOpen && !Patch::Hooks::IsVATSActive()) {
+		const bool isFurniturePending = playerCamera->QCameraEquals(RE::CameraState::kFurniture);
+		const bool isTransitionPending = playerCamera->QCameraEquals(RE::CameraState::kPCTransition);
 		const bool isKillCamActive =
 			playerCamera->QCameraEquals(RE::CameraState::kVATS) ||
 			playerCamera->QCameraEquals(RE::CameraState::kAnimated);
@@ -808,7 +912,7 @@ namespace ImprovedCamera {
 			playerCamera->QCameraEquals(RE::CameraState::kFirstPerson) ||
 			playerCamera->QCameraEquals(RE::CameraState::kIronSights);
 
-		if (!isFurnitureNow && !isTransitionNow && !isKillCamActive && isStableGameplayState) {
+		if (!isFurniturePending && !isTransitionPending && !isKillCamActive && isStableGameplayState) {
 			if (m_PseudoReenableFrameCount > 0)
 				m_PseudoReenableFrameCount--;
 			if (m_PseudoReenableFrameCount <= 0) {
@@ -846,9 +950,14 @@ namespace ImprovedCamera {
 	}
 
 		// --- ADS (Starfield-style) ---
-		static bool wasAiming = false;
 		static bool headHidden = false;
-		if (m_PseudoFPPActive && !IsBlockingMenuOpen() && !Patch::Hooks::IsVATSActive()) {
+		const bool isFurnitureADS = playerCamera->QCameraEquals(RE::CameraState::kFurniture);
+		const bool isTransitionADS = playerCamera->QCameraEquals(RE::CameraState::kPCTransition);
+		const bool isFurnitureNow = isFurnitureADS;
+		const bool isTransitionNow = isTransitionADS;
+		if (m_PseudoFPPActive && !isFurnitureADS && !isTransitionADS &&
+			m_PseudoMenuBlockFrames <= 0 && !(playerCamera->pipboyMode) &&
+			!IsBlockingMenuOpen() && !m_TerminalMenuIsOpen && !Patch::Hooks::IsVATSActive()) {
 			auto* player = RE::PlayerCharacter::GetSingleton();
 
 			// --- Hide the player's head while the rig pins the camera to it ---
@@ -859,10 +968,7 @@ namespace ImprovedCamera {
 				headNode->SetAppCulled(true);
 			headHidden = true;
 
-			const bool isFurnitureNow = playerCamera->QCameraEquals(RE::CameraState::kFurniture);
-			const bool isTransitionNow = playerCamera->QCameraEquals(RE::CameraState::kPCTransition);
-
-			if (!isFurnitureNow && !isTransitionNow) {
+			{
 				// Poll the physical aim button/trigger instead of relying on the
 				// engine's kIronSights camera state. Aiming while the game is in
 				// third person (which is what the pseudo camera is under the hood)
@@ -877,31 +983,33 @@ namespace ImprovedCamera {
 				const bool isTPP = playerCamera->QCameraEquals(RE::CameraState::k3rdPerson);
 				const bool isFPP = playerCamera->QCameraEquals(RE::CameraState::kFirstPerson);
 				const bool isIronSightsNow = playerCamera->QCameraEquals(RE::CameraState::kIronSights);
-				const bool isWeaponDrawn = player && Helper::IsWeaponDrawn(player);
+				// The pseudo camera may switch to real FPP ONLY while the aim
+				// button/trigger is physically held. Anything else (weapon
+				// draw, POV toggle, scripts) must keep the pseudo camera.
 				const bool isAimingNow = (isADSKeyDown || isGamepadAimingNow) && (isIronSightsNow || isTPP || isFPP);
 
 				if (isAimingNow) {
-					if (!isFPP) {
+					// Switch from the pseudo camera to real FPP for aiming.
+					// Once the engine has taken over into kIronSights (the real
+					// ADS zoom) leave it alone - yanking it back to kFirstPerson
+					// every frame would make the iron-sights view flicker.
+					if (!isFPP && !isIronSightsNow) {
 						playerCamera->SetState(playerCamera->GetState(RE::CameraState::kFirstPerson).get());
 						LOG_INFO("Pseudo-FPP: ADS -> FPP");
 					}
 				}
 				else {
-					// Not aiming: keep the pseudo rig active. If the
-					// engine dropped us into real FPP or iron sights
-					// (e.g. the weapon-drawn camera) while pseudo is
-					// enabled, return to the pseudo k3rdPerson so
-					// normal shooting stays on the pseudo camera.
-					if ((isFPP || isIronSightsNow) && isWeaponDrawn) {
+					// Not aiming: the pseudo camera is the only allowed camera.
+					// If we ended up in real FPP / iron sights (ADS end, or the
+					// engine / POV toggle dropped us there) return to the pseudo
+					// k3rdPerson. The engine's own weapon-drawn kFirstPerson
+					// request is already blocked in ThirdPersonState::Update, so
+					// this only fires on genuine state leaks, not every frame.
+					if (isFPP || isIronSightsNow) {
 						RestorePseudoK3rdPerson();
-						LOG_INFO("Pseudo-FPP: weapon drawn -> TPP (restore pseudo, wasIronSights={})", isIronSightsNow);
-					}
-					else if (wasAiming && (isFPP || isIronSightsNow)) {
-						RestorePseudoK3rdPerson();
-						LOG_INFO("Pseudo-FPP: ADS end -> TPP (restore pseudo)");
+						LOG_INFO("Pseudo-FPP: restored pseudo camera (isFPP={}, wasIronSights={})", isFPP ? 1 : 0, isIronSightsNow ? 1 : 0);
 					}
 				}
-				wasAiming = isAimingNow;
 			}
 
 		// --- Body follows camera yaw ---
@@ -933,7 +1041,6 @@ namespace ImprovedCamera {
 		}
 	}
 	else {
-		wasAiming = false;
 		if (headHidden) {
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			RE::NiAVObject* headNode = nullptr;
