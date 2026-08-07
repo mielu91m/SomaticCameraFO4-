@@ -1,9 +1,14 @@
 Somatic Camera FO4 — Pseudo First-Person Camera for Fallout 4
 
 Beta 5:
+
 Fixed the Pip-Boy;
+
 Fixed the Terminal;
+
 Fixed other bugs / general bug fixes.
+
+
 
 Added MCM support (by registrator2000);
 
@@ -11,8 +16,7 @@ You can now change settings in MCM without exiting the game:
 - fHeightOffset
 - fForwardOffset
 - iToggleKey
-- 
-Fixed several reported bugs
+- Fixed several reported bugs
 
 Description:
 
