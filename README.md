@@ -1,8 +1,9 @@
 Somatic Camera FO4 — Pseudo First-Person Camera for Fallout 4
 
-Beta 4:
-
-Fixed Pip-Boy — it now shows up in pseudo camera mode (when a weapon is equipped, the Pip-Boy camera currently falls back to standard 3rd person; still working on a fix);
+Beta 5:
+Fixed the Pip-Boy;
+Fixed the Terminal;
+Fixed other bugs / general bug fixes.
 
 Added MCM support (by registrator2000);
 
